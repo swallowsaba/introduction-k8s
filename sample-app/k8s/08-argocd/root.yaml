@@ -1,0 +1,23 @@
+# App-of-Apps: これ1つ apply すれば、配下の Application がすべて同期される
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+  finalizers:
+  - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/swallowsaba/todo-manifests
+    targetRevision: main
+    path: argocd/apps           # 配下の Application 群
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true

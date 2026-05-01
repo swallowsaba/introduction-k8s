@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ミニ TODO</title>
+  <style>
+    :root {
+      --bg: #f7f7fb;
+      --card: #fff;
+      --text: #222;
+      --primary: #326ce5;
+      --border: #e2e2e8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, "Hiragino Sans", "Yu Gothic UI", system-ui, sans-serif;
+      background: var(--bg); color: var(--text);
+    }
+    .container { max-width: 640px; margin: 40px auto; padding: 0 16px; }
+    h1 { color: var(--primary); }
+    .card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 8px; padding: 16px; margin-bottom: 12px;
+    }
+    .row { display: flex; gap: 8px; margin-bottom: 16px; }
+    input[type="text"] {
+      flex: 1; padding: 10px; border: 1px solid var(--border); border-radius: 6px;
+    }
+    button {
+      padding: 10px 16px; background: var(--primary); color: #fff;
+      border: 0; border-radius: 6px; cursor: pointer;
+    }
+    button:hover { opacity: 0.9; }
+    .todo {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 8px 12px;
+    }
+    .done { text-decoration: line-through; color: #999; }
+    .meta { font-size: 12px; color: #888; }
+    .delete {
+      background: transparent; color: #c33; padding: 4px 8px; font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>ミニ TODO</h1>
+    <div class="row">
+      <input id="title" type="text" placeholder="やることを入力" />
+      <button onclick="addTodo()">追加</button>
+    </div>
+    <div id="list"></div>
+    <p class="meta">サンプル: 入門 Kubernetes</p>
+  </div>
+  <script>
+    const API = "/api";
+    async function load() {
+      const res = await fetch(`${API}/todos`);
+      const todos = await res.json();
+      const list = document.getElementById("list");
+      list.innerHTML = "";
+      todos.forEach(t => {
+        const card = document.createElement("div");
+        card.className = "card todo" + (t.done ? " done" : "");
+        card.innerHTML = `
+          <span>${escape(t.title)}</span>
+          <span>
+            <button onclick="toggle(${t.id}, ${!t.done})">${t.done ? "↺" : "✓"}</button>
+            <button class="delete" onclick="del(${t.id})">削除</button>
+          </span>`;
+        list.appendChild(card);
+      });
+    }
+    async function addTodo() {
+      const title = document.getElementById("title").value.trim();
+      if (!title) return;
+      await fetch(`${API}/todos`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title })
+      });
+      document.getElementById("title").value = "";
+      load();
+    }
+    async function toggle(id, done) {
+      await fetch(`${API}/todos/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ done })
+      });
+      load();
+    }
+    async function del(id) {
+      await fetch(`${API}/todos/${id}`, { method: "DELETE" });
+      load();
+    }
+    function escape(s) {
+      return s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+    }
+    load();
+  </script>
+</body>
+</html>

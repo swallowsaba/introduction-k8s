@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: todo-config
+data:
+  LOG_LEVEL: info
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: todo
+  DB_USER: todo
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"

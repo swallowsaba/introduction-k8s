@@ -1,0 +1,40 @@
+image:
+  registry: 192.168.56.10:5000
+  api: todo-api
+  frontend: todo-frontend
+  worker: todo-worker
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+replicaCount:
+  api: 2
+  frontend: 2
+
+resources:
+  api:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits:   {memory: 256Mi}
+  frontend:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits:   {memory: 128Mi}
+
+ingress:
+  enabled: true
+  className: nginx
+  host: todo.local
+
+postgres:
+  storage: 5Gi
+  password: changeme
+
+redis:
+  storage: 1Gi
+
+secret:
+  jwtKey: changeme
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70

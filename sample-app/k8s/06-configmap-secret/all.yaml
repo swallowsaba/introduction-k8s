@@ -1,0 +1,78 @@
+# 第6章: ConfigMap / Secret に分離
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: todo
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: todo-config
+  namespace: todo
+data:
+  LOG_LEVEL: info
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: todo
+  DB_USER: todo
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: todo-secret
+  namespace: todo
+type: Opaque
+stringData:
+  DB_PASSWORD: changeme
+  POSTGRES_PASSWORD: changeme
+---
+# API
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: todo-api
+  namespace: todo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: todo-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: todo-api
+      annotations:
+        # ConfigMap/Secret 変更時の自動再起動用 (運用ではCIで埋める)
+        checksum/config: "v1"
+    spec:
+      containers:
+      - name: api
+        image: 192.168.56.10:5000/todo-api:0.1.0
+        ports:
+        - containerPort: 8000
+        envFrom:
+        - configMapRef: {name: todo-config}
+        - secretRef:    {name: todo-secret}
+        readinessProbe:
+          httpGet: {path: /readyz, port: 8000}
+          periodSeconds: 5
+        livenessProbe:
+          httpGet: {path: /healthz, port: 8000}
+          periodSeconds: 10
+        resources:
+          requests: {cpu: 100m, memory: 128Mi}
+          limits:   {memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: todo-api
+  namespace: todo
+spec:
+  selector:
+    app.kubernetes.io/name: todo-api
+  ports:
+  - port: 80
+    targetPort: 8000

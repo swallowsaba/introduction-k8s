@@ -1,0 +1,41 @@
+# 環境ごとに Application を自動生成
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: todo
+  namespace: argocd
+spec:
+  generators:
+  - list:
+      elements:
+      - env: dev
+        namespace: todo-dev
+      - env: prod
+        namespace: todo-prod
+  template:
+    metadata:
+      name: 'todo-{{env}}'
+      labels:
+        app.kubernetes.io/part-of: todo
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/swallowsaba/todo-manifests
+        targetRevision: main
+        path: 'overlays/{{env}}'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{namespace}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+        - CreateNamespace=true
+        - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            maxDuration: 3m
+            factor: 2

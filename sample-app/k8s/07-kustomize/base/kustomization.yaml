@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- namespace.yaml
+- configmap.yaml
+- secret.yaml
+- api.yaml
+- frontend.yaml
+- postgres.yaml
+- redis.yaml
+- ingress.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: todo
+  app.kubernetes.io/managed-by: kustomize
+
+images:
+- name: todo-api
+  newName: 192.168.56.10:5000/todo-api
+  newTag: "0.1.0"
+- name: todo-frontend
+  newName: 192.168.56.10:5000/todo-frontend
+  newTag: "0.1.0"

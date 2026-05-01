@@ -1,0 +1,170 @@
+# 第3章: StatefulSet/CronJob/Init/Sidecar を導入
+# Postgres と Redis を StatefulSet 化、通知 Worker を CronJob 化
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: todo
+---
+# Postgres StatefulSet + Headless Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: todo
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+  - port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: todo
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16
+        env:
+        - {name: POSTGRES_DB, value: todo}
+        - {name: POSTGRES_USER, value: todo}
+        - {name: POSTGRES_PASSWORD, value: changeme}
+        - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests:
+          storage: 5Gi
+---
+# Redis StatefulSet
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: todo
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+  - port: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: todo
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        volumeMounts:
+        - name: data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests:
+          storage: 1Gi
+---
+# API: Init で DB 待ちを実装
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: todo-api
+  namespace: todo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: todo-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: todo-api
+    spec:
+      initContainers:
+      - name: wait-for-db
+        image: busybox:1.36
+        command: ['sh','-c','until nc -z postgres 5432; do echo waiting for db; sleep 2; done']
+      containers:
+      - name: api
+        image: 192.168.56.10:5000/todo-api:0.1.0
+        ports:
+        - containerPort: 8000
+        env:
+        - {name: DB_HOST, value: postgres}
+        - {name: DB_USER, value: todo}
+        - {name: DB_NAME, value: todo}
+        - {name: DB_PASSWORD, value: changeme}
+        - {name: REDIS_HOST, value: redis}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: todo-api
+  namespace: todo
+spec:
+  selector:
+    app.kubernetes.io/name: todo-api
+  ports:
+  - port: 80
+    targetPort: 8000
+---
+# 通知 CronJob
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: todo-notify
+  namespace: todo
+spec:
+  schedule: "0 9 * * *"
+  timeZone: "Asia/Tokyo"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: notify
+            image: 192.168.56.10:5000/todo-worker:0.1.0
+            env:
+            - {name: DB_HOST, value: postgres}
+            - {name: DB_USER, value: todo}
+            - {name: DB_NAME, value: todo}
+            - {name: DB_PASSWORD, value: changeme}
+            - {name: REDIS_HOST, value: redis}

@@ -1,0 +1,80 @@
+title: 入門 Kubernetes
+description: Minikubeから始めて、kubeadmでクラスタを自前構築し、本番運用・GitOps・可観測性・SREまで網羅するローカル完結型の学習教材
+remote_theme: just-the-docs/just-the-docs
+url: ""
+baseurl: "/introduction-k8s"
+
+permalink: pretty
+
+# 検索を有効化
+search_enabled: true
+search:
+  heading_level: 3
+  previews: 3
+  preview_words_before: 5
+  preview_words_after: 10
+  tokenizer_separator: /[\s\-/]+/
+  rel_url: true
+  button: false
+
+# サイドバーのナビゲーション
+nav_enabled: true
+
+# ヘッダー右上のリポジトリリンク
+aux_links:
+  "GitHub":
+    - "https://github.com/swallowsaba/introduction-k8s"
+
+aux_links_new_tab: true
+
+# フッター
+footer_content: '本教材は <a href="https://opensource.org/licenses/MIT">MIT License</a> のもと公開されています。'
+
+# 階層構造を有効化
+heading_anchors: true
+
+# コードハイライト
+color_scheme: light
+
+# Mermaid図を有効化
+mermaid:
+  version: "10.9.0"
+
+# プラグイン
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+# 除外
+exclude:
+  - sample-app/
+  - README.md
+  - Gemfile
+  - Gemfile.lock
+  - vendor/
+
+# Markdown
+markdown: kramdown
+kramdown:
+  syntax_highlighter: rouge
+  syntax_highlighter_opts:
+    block:
+      line_numbers: false
+  input: GFM
+  hard_wrap: false
+
+# Callout (just-the-docsの注釈ボックス)
+callouts_level: quiet
+callouts:
+  warning:
+    title: 注意
+    color: red
+  note:
+    title: メモ
+    color: blue
+  tip:
+    title: ヒント
+    color: green
+  important:
+    title: 重要
+    color: yellow

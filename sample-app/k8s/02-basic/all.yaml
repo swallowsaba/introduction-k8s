@@ -1,0 +1,162 @@
+# 第2章: 基本リソースだけで動かすバージョン
+# 永続化なし(再起動でデータ消える)、Secret は ベタ書き
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: todo
+---
+# Frontend
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: todo-frontend
+  namespace: todo
+  labels:
+    app.kubernetes.io/name: todo-frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: todo-frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: todo-frontend
+    spec:
+      containers:
+      - name: nginx
+        image: 192.168.56.10:5000/todo-frontend:0.1.0
+        ports:
+        - containerPort: 80
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits:   {memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: todo-frontend
+  namespace: todo
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: todo-frontend
+  ports:
+  - port: 80
+    targetPort: 80
+    nodePort: 30080
+---
+# API
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: todo-api
+  namespace: todo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: todo-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: todo-api
+    spec:
+      containers:
+      - name: api
+        image: 192.168.56.10:5000/todo-api:0.1.0
+        ports:
+        - containerPort: 8000
+        env:
+        - {name: DB_HOST, value: postgres}
+        - {name: DB_USER, value: todo}
+        - {name: DB_NAME, value: todo}
+        - {name: DB_PASSWORD, value: changeme}    # 章6でSecret化
+        - {name: REDIS_HOST, value: redis}
+        resources:
+          requests: {cpu: 100m, memory: 128Mi}
+          limits:   {memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: todo-api
+  namespace: todo
+spec:
+  selector:
+    app.kubernetes.io/name: todo-api
+  ports:
+  - port: 80
+    targetPort: 8000
+---
+# Postgres (簡易: emptyDir, 章5で永続化)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: todo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16
+        env:
+        - {name: POSTGRES_DB, value: todo}
+        - {name: POSTGRES_USER, value: todo}
+        - {name: POSTGRES_PASSWORD, value: changeme}
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: todo
+spec:
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+  - port: 5432
+---
+# Redis
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: todo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: todo
+spec:
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+  - port: 6379
