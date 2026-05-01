@@ -12,7 +12,7 @@ permalink: /
 ローカル完結で、**Kubernetesを実サービスに使えるレベル**まで体系的に学ぶ。
 {: .fs-6 .fw-300 }
 
-[学習を始める](01-introduction/k8s){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
+[学習を始める]({{ '/01-introduction/k8s/' | relative_url }}){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
 [GitHubリポジトリ](https://github.com/swallowsaba/introduction-k8s){: .btn .fs-5 .mb-4 .mb-md-0 }
 
 ---
