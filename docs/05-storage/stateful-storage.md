@@ -1,7 +1,7 @@
 ---
 title: ステートフル運用の実例
 parent: 05. ストレージ
-nav_order: 4
+nav_order: 5
 ---
 
 # ステートフル運用の実例

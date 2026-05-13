@@ -955,4 +955,4 @@ Pod スケジューリングと同時に PV が作られたことが確認でき
 - [ ] `reclaimPolicy: Retain` を本番で使うシーンを SC 単位で設計できる
 - [ ] CSI ドライバが `Controller` と `Node` の Pod に分かれている理由を説明できる
 
-→ 次は [ステートフル運用の実例]({{ '/05-storage/stateful-storage/' | relative_url }})
+→ 次は [NFS 完全ガイド ― 仕組みから運用まで]({{ '/05-storage/nfs-deep-dive/' | relative_url }})
