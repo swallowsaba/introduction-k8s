@@ -50,7 +50,7 @@ Linux で言えば apt や yum、Mac の brew、Node.js の npm に相当する�
 | RBAC | 1 |
 | **合計** | **約 20** |
 
-これを dev / stg / prod の 3 環境に展開すると **60 ファイル**。さらに「prod の API は replicas を増やしたい」「stg は HPA 無効」など、**環境差異** が出てきます。
+これを dev / stg / prod の 3 環境に展開すると **60 ファイル**。さらに「prod の API は replicas を増やしたい」「stg は HPA 無効」など、**環境差異** が出ます。
 
 ```mermaid
 flowchart LR
@@ -90,7 +90,7 @@ timeline
 
 ### Helm 2 から 3 への移行(Tiller 廃止)
 
-Helm 2 はクラスタ内に **Tiller** というサーバを動かしていました。`helm install` するとクライアント(`helm` CLI)が Tiller に依頼し、Tiller が cluster-admin 権限で K8s API を叩く構成でした。
+Helm 2 はクラスタ内に **Tiller** というサーバを動かしていました。`helm install` するとクライアント(`helm` CLI)が Tiller に依頼し、Tiller が cluster-admin 権限で K8s API を叩きます。
 
 ```mermaid
 flowchart LR
@@ -359,6 +359,7 @@ affinity: {}
 
 ### _helpers.tpl(共通ロジック)
 
+{% raw %}
 ```
 {{/*
 名前生成
@@ -408,11 +409,13 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- $name | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 ```
+{% endraw %}
 
 これらは `templates/*.yaml` から `{{ include "todo.fullname" . }}` などで呼び出します。
 
 ### templates/deployment.yaml
 
+{% raw %}
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
@@ -477,6 +480,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
 ```
+{% endraw %}
 
 ポイント:
 
@@ -490,12 +494,14 @@ spec:
 
 ### checksum アノテーションのテクニック
 
+{% raw %}
 ```yaml
 template:
   metadata:
     annotations:
       checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
 ```
+{% endraw %}
 
 ConfigMap / Secret の内容が変わると、Pod template の annotation が変わる → Deployment の rolloutUpdate が走る。
 これがないと「ConfigMap 更新したのに Pod に反映されない」事故になります。
@@ -504,15 +510,18 @@ ConfigMap / Secret の内容が変わると、Pod template の annotation が変
 
 ### 値参照
 
+{% raw %}
 ```
 {{ .Values.replicaCount }}            # values.yaml の値
 {{ .Chart.Name }}                     # Chart.yaml の name
 {{ .Release.Name }}                   # `helm install` 時に指定した名前
 {{ .Release.Namespace }}              # デプロイ先
 ```
+{% endraw %}
 
 ### 条件分岐
 
+{% raw %}
 ```
 {{- if .Values.ingress.enabled }}
 ... ingress 関連 ...
@@ -524,9 +533,11 @@ ConfigMap / Secret の内容が変わると、Pod template の annotation が変
 {{- if and .Values.foo.enabled .Values.bar.enabled }}
 {{- end }}
 ```
+{% endraw %}
 
 ### ループ
 
+{% raw %}
 ```
 {{- range .Values.ingress.hosts }}
 - host: {{ .host | quote }}
@@ -538,23 +549,28 @@ ConfigMap / Secret の内容が変わると、Pod template の annotation が変
     {{- end }}
 {{- end }}
 ```
+{% endraw %}
 
 ### パイプ
 
+{% raw %}
 ```
 {{ .Values.foo | upper }}
 {{ .Values.foo | default "bar" }}
 {{ .Values.foo | quote }}
 {{ .Values.foo | toYaml | nindent 4 }}
 ```
+{% endraw %}
 
 ### `-` の意味
 
+{% raw %}
 ```
 {{- if foo -}}
 ```
 
 `{{-` は左の空白を削除、`-}}` は右の空白を削除。テンプレート結果の余分な空行を除去。
+{% endraw %}
 
 ## 環境ごとの values
 
@@ -998,106 +1014,3 @@ ConfigMap だけ変えると、Pod は気づかない。`checksum/config` annota
 | `Error: failed pre-install: ...` | pre-install Hook 失敗 | Hook の Job ログ確認 |
 | `release foo failed, and has been uninstalled` | `--atomic` で自動 rollback | エラー原因を直す |
 | `another operation (install/upgrade/rollback) is in progress` | 直前操作が pending | `helm rollback` か Secret を手動 delete |
-| `chart "x" not found` | repo update 漏れ | `helm repo update` |
-| `forbidden: User "system:serviceaccount:..." cannot ...` | RBAC 不足 | kubeconfig 権限確認 |
-
-## ハンズオン
-
-### 1. サンプル Chart の生成と install
-
-```bash
-helm create todo
-helm lint ./todo
-helm template todo ./todo
-helm install todo ./todo -n todo --create-namespace
-helm list -A
-helm get manifest todo -n todo | head -50
-```
-
-### 2. values 上書き
-
-```bash
-helm upgrade todo ./todo -n todo --set replicaCount=3
-kubectl get deploy -n todo
-# REPLICAS が 3 になる
-```
-
-### 3. dependencies 追加
-
-`Chart.yaml` に postgres / redis を足して:
-
-```bash
-helm dependency update ./todo
-ls ./todo/charts/
-# postgresql-15.5.0.tgz  redis-19.0.0.tgz
-helm upgrade todo ./todo -n todo
-kubectl get pods -n todo
-# postgres / redis が増える
-```
-
-### 4. ロールバック
-
-```bash
-helm history todo -n todo
-helm rollback todo 1 -n todo
-helm history todo -n todo
-# REVISION 4 として「rollback to 1」が記録される
-```
-
-### 5. helm diff の体験
-
-```bash
-helm plugin install https://github.com/databus23/helm-diff
-helm diff upgrade todo ./todo -n todo --set replicaCount=10
-# 差分が色付きで出る
-```
-
-### 6. パッケージング
-
-```bash
-helm package ./todo
-# todo-0.1.0.tgz
-
-# 別の場所にインストール
-helm install todo2 ./todo-0.1.0.tgz -n todo
-```
-
-## 本番運用のベストプラクティス
-
-```mermaid
-flowchart TB
-    A[本番Helm運用] --> B[helm diff を必ず実行]
-    A --> C[helm lint をCIで強制]
-    A --> D[Chart.lockをcommit]
-    A --> E[appVersion更新時はversionも更新]
-    A --> F[--atomic フラグ]
-    A --> G[Helm Hook の冪等性]
-    A --> H[history-max の設定]
-    A --> I[GitOps連携]
-    I --> I1[ArgoCD / Flux]
-```
-
-### Chart 設計の Tips
-
-- **values は階層化**: `image.repository` のように
-- **defaults は安全側**: 開発で動く前提でなく、本番で動く前提
-- **共通ロジックは _helpers.tpl**: ラベル、名前生成
-- **Subchart は最小限**: 過度な依存は upgrade を辛くする
-- **resources の中身を toYaml**: ユーザが自由に書けるように
-- **Schema(values.schema.json)で values 検証**: typo 防止
-
-## チェックポイント
-
-- [ ] Chart 化のメリットを 3 つ以上挙げられる
-- [ ] Chart / Release / Repository の関係を図にできる
-- [ ] Helm 2 から 3 で Tiller がなくなった理由を説明できる
-- [ ] `.Values` / `.Chart` / `.Release` の意味を区別して言える
-- [ ] `nindent` / `toYaml` / `default` / `quote` の用途
-- [ ] `checksum/config` annotation の役割
-- [ ] `helm diff` を使った安全なアップグレードフロー
-- [ ] 既存 Helm Chart に依存(dependency)を追加できる
-- [ ] Subchart の値を values.yaml から渡す書き方
-- [ ] Helm Hook の使いどころを 3 つ以上挙げられる
-- [ ] Helm と Kustomize を併用するパターンを説明できる
-
-→ 次は [Kustomize]({{ '/07-production/kustomize/' | relative_url }})
