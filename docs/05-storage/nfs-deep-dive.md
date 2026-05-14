@@ -7996,6 +7996,1906 @@ ssh k8s-nfs "sudo rm -rf /srv/nfs/k8s/static/uploads/*"
 
 ---
 
+# 第 14 部: CSI Driver の歴史と nfs.csi.k8s.io アーキテクチャ深堀り
+
+第 4 部では NFS-CSI ドライバを「使う」観点で扱いました。本パートでは **CSI そのものの歴史と内部設計** を、Kubernetes ストレージ進化の文脈で深堀りします。CSI を本当に理解するには、それ以前の **in-tree plugin と FlexVolume の歴史的経緯** を知る必要があります。
+
+## 14.1 ストレージプラグインの 3 世代
+
+```mermaid
+timeline
+    title Kubernetes ストレージプラグイン進化
+    2014 : in-tree plugin<br>(Kubernetes 本体に組込)
+    2016 : FlexVolume<br>(out-of-tree 実行ファイル)
+    2018 : CSI 1.0 GA<br>(gRPC 標準化)
+    2021 : CSI Migration 全面進行<br>(in-tree 廃止フェーズ)
+    2024 : 主要 in-tree 完全削除<br>(AWS EBS, GCE PD, Azure Disk)
+```
+
+| 世代 | 形式 | 利点 | 欠点 |
+|------|------|------|------|
+| in-tree | K8s 本体に Go でコード組込 | 性能良、確実な動作 | K8s リリースサイクルに縛られる、サードパーティが寄与しづらい、攻撃面拡大 |
+| FlexVolume | ノード上の実行ファイル(`/usr/libexec/kubernetes/kubelet-plugins/volume/exec/...`) | out-of-tree、言語自由 | デプロイ困難(ノードに直接バイナリ配置)、依存関係管理が手作業 |
+| CSI | コンテナ化された gRPC サービス | 完全に out-of-tree、Kubernetes 非依存(他コンテナオーケストレータでも使える) | 設計が複雑、サイドカー多数 |
+
+### 14.1.1 in-tree plugin の時代(2014〜)
+
+Kubernetes v1.0 時代、すべてのストレージプラグインは **K8s 本体のソースコード** に直接書き込まれていました。`pkg/volume/aws_ebs/`、`pkg/volume/gce_pd/`、`pkg/volume/nfs/` などです。
+
+```bash
+# Kubernetes v1.18 のソース構造(参考)
+ls staging/src/k8s.io/legacy-cloud-providers/...
+ls pkg/volume/...
+# aws_ebs/  azure_dd/  azure_file/  cephfs/  cinder/  configmap/  csi/
+# downwardapi/  empty_dir/  fc/  flexvolume/  flocker/  gce_pd/  git_repo/
+# glusterfs/  host_path/  iscsi/  local/  nfs/  photon_pd/  portworx/
+# projected/  quobyte/  rbd/  scaleio/  secret/  storageos/  vsphere_volume/
+```
+
+**問題点**:
+
+1. **リリース速度の縛り** ─ AWS EBS の新機能を入れたい場合でも、K8s のメジャーリリース(数ヶ月単位)を待つ必要があった
+2. **コードベース肥大化** ─ 全クラウドベンダーのコードが K8s 本体に同居 → kube-apiserver や kubelet バイナリが肥大化
+3. **依存関係の地獄** ─ AWS SDK と GCE SDK が同じバイナリに入る → ベンダーロックインや脆弱性連鎖
+4. **テストカバレッジ** ─ K8s チームが全クラウドのテストを面倒見るのは無理
+5. **サードパーティ参入障壁** ─ Pure Storage や NetApp が独自プラグインを入れるには K8s 本体への PR が必要
+
+### 14.1.2 FlexVolume(2016)
+
+これらの問題を解決する最初の試みが **FlexVolume** です。FlexVolume はノード上に **実行可能ファイル** を配置し、K8s がそれを呼び出す方式でした。
+
+```mermaid
+sequenceDiagram
+    participant K as kubelet
+    participant F as /usr/libexec/.../exec/vendor~driver/driver
+    participant V as ストレージ(NFS等)
+    K->>F: ./driver mount /mnt/pv-xxx '{"server":"..."}'
+    F->>V: 実際のマウント
+    F-->>K: {"status":"Success"}
+```
+
+**呼び出されるコマンド一覧**:
+
+| サブコマンド | 役割 |
+|------------|------|
+| `init` | プラグイン初期化 |
+| `attach` | ボリュームをノードに接続 |
+| `detach` | ボリュームをノードから切離 |
+| `mount` | マウント実行 |
+| `unmount` | アンマウント実行 |
+| `getvolumename` | ボリューム識別子取得 |
+
+**問題点**:
+
+1. **デプロイの困難** ─ 全ノードの `/usr/libexec/...` に手作業で配置する必要があった(Kubernetes 標準のマニフェストでは管理できない)
+2. **依存ライブラリ問題** ─ 実行ファイルがノードの glibc やシェルに依存
+3. **動的プロビジョニングが弱い** ─ 当初は静的 PV しか対応していなかった
+4. **デバッグが困難** ─ プラグインのログをまとめて見る仕組みが弱い
+
+NFS でも `kubernetes.io/nfs` という in-tree プラグインが長く使われた一方、FlexVolume 版の NFS は普及しませんでした。
+
+### 14.1.3 CSI(Container Storage Interface, 2018 GA)
+
+**CSI は CNCF が策定した、Kubernetes 専用ではない汎用ストレージインターフェース仕様** です。Kubernetes、Mesos、Cloud Foundry、Nomad など、複数のコンテナオーケストレータが共通で使えることを目標にしています。
+
+```mermaid
+flowchart LR
+    subgraph K[Orchestrators]
+        Kub[Kubernetes]
+        Nom[Nomad]
+        Mes[Mesos]
+        CF[Cloud Foundry]
+    end
+    CSI[CSI 仕様<br>gRPC over UNIX socket]
+    subgraph D[Drivers]
+        EBS[aws-ebs-csi-driver]
+        NFS[nfs.csi.k8s.io]
+        Ceph[ceph-csi]
+        Lon[longhorn-csi]
+        Net[netapp-trident]
+    end
+    Kub & Nom & Mes & CF --> CSI --> EBS & NFS & Ceph & Lon & Net
+```
+
+**CSI の特徴**:
+
+- **gRPC over UNIX domain socket** で通信
+- **Identity / Controller / Node** の 3 サービスを定義
+- ドライバは **完全にコンテナイメージ** として配布(K8s なら Deployment + DaemonSet)
+- **標準サイドカー**(external-provisioner、external-attacher、external-resizer、external-snapshotter)が Kubernetes と CSI ドライバの橋渡し
+- ドライバベンダーは **CSI 本体のロジック** だけ書けばよい(K8s API は標準サイドカーが面倒見る)
+
+### 14.1.4 CSI Migration の進行
+
+K8s v1.17 で **CSI Migration** という仕組みが alpha 登場しました。これは **「既存の in-tree PV / PVC マニフェストを、内部的に CSI 呼び出しに変換する」** 互換レイヤです。
+
+```mermaid
+flowchart TB
+    A[既存 manifest<br>volume.kubernetes.io/aws-ebs] --> B[CSI Migration Shim]
+    B -->|変換| C[ebs.csi.aws.com<br>CSI driver]
+    C --> D[実際の EBS 操作]
+```
+
+これにより、ユーザは **manifest を書き換えずに** in-tree → CSI 移行ができました。各 in-tree プラグインの状況(v1.30 時点):
+
+| in-tree プラグイン | CSI ドライバ | Migration GA | in-tree 廃止 |
+|------------------|------------|--------------|--------------|
+| `kubernetes.io/aws-ebs` | `ebs.csi.aws.com` | v1.25 | v1.27 で削除 |
+| `kubernetes.io/gce-pd` | `pd.csi.storage.gke.io` | v1.25 | v1.28 で削除 |
+| `kubernetes.io/azure-disk` | `disk.csi.azure.com` | v1.24 | v1.28 で削除 |
+| `kubernetes.io/azure-file` | `file.csi.azure.com` | v1.26 | v1.30 で削除 |
+| `kubernetes.io/cinder` | `cinder.csi.openstack.org` | v1.24 | v1.26 で削除 |
+| `kubernetes.io/vsphere-volume` | `csi.vsphere.vmware.com` | v1.25 | v1.29 で削除 |
+| **`kubernetes.io/nfs`** | **`nfs.csi.k8s.io`** | (Migration なし) | **v1.25 で削除** |
+
+{: .important }
+> **`kubernetes.io/nfs` in-tree プラグインは Kubernetes v1.25 で完全削除** されました。これは Migration shim も提供されない直接廃止です。古い manifest の `spec.nfs:` 直書きの PV は今でも動きますが、これは厳密には in-tree NFS ではなく、kubelet がカーネル NFS を直接マウントする **PV 内蔵の NFS マウンタ** であり、CSI ドライバを通りません。
+>
+> 動的プロビジョニング、VolumeSnapshot、PVC リサイズなどモダンな機能を使うには **`nfs.csi.k8s.io`** に統一する必要があります。本教材も `nfs.csi.k8s.io` 前提です。
+
+### 14.1.5 PV `spec.nfs:` 直書きと CSI の使い分け
+
+両者は共存できます。具体的にはこう使い分けます。
+
+| 用途 | 方式 |
+|------|------|
+| 静的 PV のみ、シンプルさ重視 | `spec.nfs:` 直書き(本教材の uploads PV) |
+| 動的プロビジョニング | StorageClass + `nfs.csi.k8s.io` |
+| VolumeSnapshot を使いたい | `nfs.csi.k8s.io` 必須 |
+| PVC オンラインリサイズ | `nfs.csi.k8s.io` 必須 |
+
+`spec.nfs:` 直書きの PV では、CSI を介さずに **kubelet が直接 `mount.nfs` を呼ぶ** ため、CSI ドライバが落ちていても影響を受けません。一方、動的機能は使えません。
+
+## 14.2 CSI 仕様の gRPC 定義
+
+CSI 仕様は公式 protobuf 定義として公開されています([csi.proto](https://github.com/container-storage-interface/spec))。NFS-CSI を含む全 CSI ドライバはこの仕様に準拠します。
+
+### 14.2.1 3 つの gRPC サービス
+
+```protobuf
+service Identity {
+  rpc GetPluginInfo(...) returns (...) {}
+  rpc GetPluginCapabilities(...) returns (...) {}
+  rpc Probe(...) returns (...) {}
+}
+
+service Controller {
+  rpc CreateVolume(...) returns (...) {}
+  rpc DeleteVolume(...) returns (...) {}
+  rpc ControllerPublishVolume(...) returns (...) {}    // attach
+  rpc ControllerUnpublishVolume(...) returns (...) {}  // detach
+  rpc ValidateVolumeCapabilities(...) returns (...) {}
+  rpc ListVolumes(...) returns (...) {}
+  rpc GetCapacity(...) returns (...) {}
+  rpc ControllerGetCapabilities(...) returns (...) {}
+  rpc CreateSnapshot(...) returns (...) {}
+  rpc DeleteSnapshot(...) returns (...) {}
+  rpc ListSnapshots(...) returns (...) {}
+  rpc ControllerExpandVolume(...) returns (...) {}     // resize
+  rpc ControllerGetVolume(...) returns (...) {}
+  rpc ControllerModifyVolume(...) returns (...) {}     // 各種属性変更
+}
+
+service Node {
+  rpc NodeStageVolume(...) returns (...) {}            // node-global mount
+  rpc NodeUnstageVolume(...) returns (...) {}
+  rpc NodePublishVolume(...) returns (...) {}          // pod-specific bind mount
+  rpc NodeUnpublishVolume(...) returns (...) {}
+  rpc NodeGetVolumeStats(...) returns (...) {}         // df / stats
+  rpc NodeExpandVolume(...) returns (...) {}           // FS 拡張
+  rpc NodeGetCapabilities(...) returns (...) {}
+  rpc NodeGetInfo(...) returns (...) {}
+}
+```
+
+各 RPC のうち、ドライバが **どれを実装するか** はドライバ次第で、`*GetCapabilities` で「自分が何をサポートしているか」を Kubernetes に申告します。
+
+### 14.2.2 nfs.csi.k8s.io が実装している RPC
+
+```bash
+# CSI ドライバの Capabilities を確認
+kubectl get csidriver nfs.csi.k8s.io -o yaml
+```
+
+NFS-CSI が実装している主な RPC:
+
+| RPC | 実装 | 用途 |
+|-----|------|------|
+| `Identity.GetPluginInfo` | ✅ | `nfs.csi.k8s.io` + バージョン返却 |
+| `Controller.CreateVolume` | ✅ | NFS サーバ上に PVC サブディレクトリ作成 |
+| `Controller.DeleteVolume` | ✅ | サブディレクトリ削除(`reclaimPolicy: Delete` 時) |
+| `Controller.ControllerPublishVolume` | ❌(非実装) | NFS は attach 不要 |
+| `Controller.CreateSnapshot` | ✅ | サブディレクトリの rsync コピー |
+| `Controller.ControllerExpandVolume` | ✅ | メタデータ更新のみ(NFS は容量管理弱い) |
+| `Node.NodeStageVolume` | ⚠️ オプション | ノード単位の最初のマウント |
+| `Node.NodePublishVolume` | ✅ | Pod 固有のバインドマウント |
+| `Node.NodeExpandVolume` | ✅ | FS 拡張(NFS は実質 no-op) |
+| `Node.NodeGetVolumeStats` | ✅ | `df` 情報 |
+
+NFS の特殊事情として、`ControllerPublishVolume`(attach)が **存在しない** 点に注目してください。AWS EBS や iSCSI なら「ノードに LUN を接続」というステップがありますが、NFS は **クライアントから直接マウントできる** ので attach フェーズが不要です。これが CSIDriver CRD の `attachRequired: false` 設定に反映されます。
+
+```bash
+kubectl get csidriver nfs.csi.k8s.io -o jsonpath='{.spec.attachRequired}'
+# false
+```
+
+### 14.2.3 NodeStageVolume と NodePublishVolume の 2 段階構造
+
+CSI Node 系には **2 段階のマウント機構** があります。
+
+```mermaid
+flowchart LR
+    A[NFS サーバ] --> B[ノードのグローバルマウントポイント<br>/var/lib/kubelet/plugins/.../globalmount]
+    B --> C[Pod1 固有<br>/var/lib/kubelet/pods/uid1/volumes/.../mount]
+    B --> D[Pod2 固有<br>/var/lib/kubelet/pods/uid2/volumes/.../mount]
+```
+
+| 段階 | RPC | 何が起きる |
+|------|-----|----------|
+| Stage | `NodeStageVolume` | ノードにグローバルマウント(複数 Pod で 1 回だけ) |
+| Publish | `NodePublishVolume` | Pod 固有のディレクトリへバインドマウント |
+
+これにより **同じ PVC を 1 ノード上の複数 Pod が共有** できるようになります。NFS の場合、Stage は実際の `mount.nfs`、Publish は **bind mount** です。
+
+```bash
+# 実際のマウント状況を確認
+mount | grep -E '(nfs|kubelet)' | head -10
+# 192.168.56.30:/srv/nfs/... on /var/lib/kubelet/plugins/.../globalmount type nfs4 (...)
+# /var/lib/kubelet/plugins/.../globalmount on /var/lib/kubelet/pods/.../mount type none (bind,...)
+```
+
+## 14.3 nfs.csi.k8s.io の内部構造
+
+nfs.csi.k8s.io ドライバ自体は **Go で書かれた小さな gRPC サーバ** です。GitHub: [kubernetes-csi/csi-driver-nfs](https://github.com/kubernetes-csi/csi-driver-nfs)。
+
+### 14.3.1 Pod の中身
+
+第 4.2 節でインストールした状態で、各 Pod の中身を見てみます。
+
+```bash
+# Controller Pod
+kubectl get pod -n kube-system -l app=csi-nfs-controller -o yaml | grep -A2 'image:' | head -20
+# image: registry.k8s.io/sig-storage/csi-provisioner:v5.0.1
+# image: registry.k8s.io/sig-storage/csi-snapshotter:v8.0.1
+# image: registry.k8s.io/sig-storage/csi-resizer:v1.11.1
+# image: registry.k8s.io/sig-storage/livenessprobe:v2.13.1
+# image: registry.k8s.io/sig-storage/nfsplugin:v4.7.0
+
+# Node Pod(各ワーカーで)
+kubectl get pod -n kube-system -l app=csi-nfs-node -o yaml | grep -A2 'image:' | head -10
+# image: registry.k8s.io/sig-storage/livenessprobe:v2.13.1
+# image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.11.1
+# image: registry.k8s.io/sig-storage/nfsplugin:v4.7.0
+```
+
+`nfsplugin` が CSI 本体です。それ以外は **Kubernetes プロジェクトが提供する標準サイドカー** で、どの CSI ドライバでも同じものを使います。
+
+### 14.3.2 標準サイドカーの役割詳説
+
+```mermaid
+flowchart TB
+    subgraph CP[CSI Controller Pod]
+        prov[csi-provisioner<br>PVC 監視]
+        snap[csi-snapshotter<br>VolumeSnapshot 監視]
+        res[csi-resizer<br>PVC リサイズ監視]
+        nfs[nfsplugin 本体]
+    end
+    subgraph K[Kubernetes API]
+        api[kube-apiserver]
+    end
+    prov <-->|watch| api
+    snap <-->|watch| api
+    res <-->|watch| api
+    prov -.unix socket.-> nfs
+    snap -.unix socket.-> nfs
+    res -.unix socket.-> nfs
+```
+
+| サイドカー | 監視リソース | 呼び出す CSI RPC |
+|-----------|------------|-----------------|
+| `csi-provisioner` | PVC | `CreateVolume` / `DeleteVolume` |
+| `csi-attacher` | VolumeAttachment | `ControllerPublishVolume` / `ControllerUnpublishVolume` |
+| `csi-snapshotter` | VolumeSnapshot / VolumeSnapshotContent | `CreateSnapshot` / `DeleteSnapshot` |
+| `csi-resizer` | PVC (resize) | `ControllerExpandVolume` |
+| `node-driver-registrar` | (なし) | kubelet との連携(プラグイン登録) |
+| `livenessprobe` | (なし) | ヘルスチェック用 HTTP サーバ |
+
+NFS-CSI には `csi-attacher` が **入っていません**(`attachRequired: false` のため)。AWS EBS-CSI、Ceph RBD-CSI には入っています。
+
+### 14.3.3 ハンズオン: CSI gRPC を直接観察する
+
+CSI ドライバが本当に gRPC を話していることを確認します。
+
+```bash
+# Node Pod の中に入る
+NODE_POD=$(kubectl get pod -n kube-system -l app=csi-nfs-node -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -it -n kube-system $NODE_POD -c nfs -- sh
+
+# UNIX ソケットの位置
+ls -la /csi/
+# srwxr-xr-x 1 root root 0 ... csi.sock
+
+# grpcurl があれば直接呼べる(コンテナイメージには通常入っていない)
+# 代わりに、CSI ドライバ自身のログでオペレーションを観察
+exit
+
+kubectl logs -n kube-system $NODE_POD -c nfs -f
+# I0509 ... GRPC call: /csi.v1.Identity/GetPluginInfo
+# I0509 ... GRPC call: /csi.v1.Node/NodeGetCapabilities
+# I0509 ... GRPC call: /csi.v1.Node/NodePublishVolume
+# I0509 ... NodePublishVolume called with request volumeId="..."
+```
+
+これで CSI が単なる抽象ではなく、**実在の gRPC サービス** であることが見えます。
+
+### 14.3.4 ハンズオン: CSI ドライバのソースを読む
+
+NFS-CSI ドライバの実装は驚くほどシンプルです。GitHub の `pkg/nfs/` ディレクトリに以下のファイルがあります。
+
+| ファイル | 内容 |
+|---------|------|
+| `nfs.go` | ドライバエントリポイント |
+| `controllerserver.go` | `CreateVolume` などの Controller RPC 実装 |
+| `nodeserver.go` | `NodePublishVolume` などの Node RPC 実装 |
+| `identityserver.go` | `GetPluginInfo` などの Identity RPC 実装 |
+| `utils.go` | mount.nfs 呼び出しヘルパ |
+
+`controllerserver.go` の `CreateVolume` 実装の中核(疑似コード):
+
+```go
+func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
+    name := req.GetName()
+    params := req.GetParameters()
+    server := params["server"]
+    share := params["share"]
+    subDir := computeSubDir(params, req)
+
+    // 一時マウント
+    tmpDir := mountToTmpDir(server, share)
+
+    // mkdir
+    err := os.MkdirAll(filepath.Join(tmpDir, subDir), 0o777)
+
+    // umount
+    umount(tmpDir)
+
+    return &csi.CreateVolumeResponse{
+        Volume: &csi.Volume{
+            VolumeId: fmt.Sprintf("%s#%s#%s", server, share, subDir),
+            VolumeContext: params,
+        },
+    }, nil
+}
+```
+
+つまり NFS-CSI の **`CreateVolume` は単に「NFS サーバ上に mkdir する」だけ** です。それくらいシンプルな実装で、Kubernetes の完全な動的プロビジョニング機能が手に入ります。
+
+### 14.3.5 VolumeID のフォーマット
+
+`CreateVolume` が返す `VolumeID` は NFS-CSI の場合 **`server#share#subDir`** という文字列です。
+
+```bash
+kubectl get pv pvc-abc123 -o jsonpath='{.spec.csi.volumeHandle}'
+# 192.168.56.30#/srv/nfs/k8s/dynamic#todo-data-postgres-0
+```
+
+`#` 区切りで「サーバ #エクスポートパス #サブディレクトリ」が入っています。`NodePublishVolume` 時にこの ID をパースして実マウントが走ります。
+
+## 14.4 CSIDriver / CSIStorageCapacity / VolumeAttachment CRD
+
+CSI を支える Kubernetes 標準 CRD を見ていきます。
+
+### CSIDriver
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: nfs.csi.k8s.io
+spec:
+  attachRequired: false              # NFS は attach 不要
+  podInfoOnMount: true               # Pod 情報をマウント時に渡す
+  volumeLifecycleModes: [Persistent, Ephemeral]
+  fsGroupPolicy: File                # fsGroup を kubelet が適用
+```
+
+| フィールド | 意味 |
+|-----------|------|
+| `attachRequired` | `ControllerPublishVolume`(attach)を呼ぶか |
+| `podInfoOnMount` | Pod 名/Namespace を `VolumeContext` に入れる(subDir テンプレ変数で使う) |
+| `volumeLifecycleModes` | PVC ベース or Generic Ephemeral ボリュームの両対応 |
+| `fsGroupPolicy` | `fsGroup` をどう適用するか(`None`/`File`/`ReadWriteOnceWithFSType`) |
+
+### VolumeAttachment(NFS では使われない)
+
+```bash
+kubectl get volumeattachment
+# EBS や iSCSI なら表示される
+# NFS では空
+```
+
+### CSIStorageCapacity(GA で v1.24)
+
+CSI ドライバが「あといくら使えるか」をクラスタに報告する仕組み。NFS-CSI は実装しているドライバもありますが、デフォルトでは出ません。
+
+## 14.5 CSI Migration の内部メカニズム(参考)
+
+K8s が `volume.kubernetes.io/aws-ebs` の PV を見たとき、CSI Migration が有効なら以下が起きます。
+
+```mermaid
+sequenceDiagram
+    participant K as kubelet
+    participant M as Migration Shim<br>(pkg/volume/csimigration)
+    participant Drv as ebs.csi.aws.com
+    K->>K: PV を見る (spec.awsElasticBlockStore)
+    K->>M: 互換変換要求
+    M->>M: AWSElasticBlockStoreSource → CSIPersistentVolumeSource
+    M-->>K: 変換後 PV (spec.csi)
+    K->>Drv: gRPC 呼び出し
+```
+
+これにより、ユーザのマニフェストや PV/PVC オブジェクトは **一切書き換わらず** に、内部だけ CSI に切替えられます。
+
+NFS には Migration がありません(v1.25 で完全削除)。古いマニフェストの `spec.nfs:` PV は **CSI を介さず kubelet が直接マウント** する形で今でも動きます。
+
+## 14.6 CSI のトラブル時の切り分け
+
+```mermaid
+flowchart TB
+    A[PV/PVC が動かない] --> B{どの Pod?}
+    B --> C[csi-provisioner<br>= PVC 監視]
+    B --> D[csi-snapshotter<br>= snapshot 監視]
+    B --> E[csi-resizer<br>= resize 監視]
+    B --> F[csi-nfs-node<br>= マウント実行]
+    B --> G[nfsplugin 本体<br>= CSI gRPC]
+    C --> CL[kubectl logs ... csi-provisioner]
+    D --> DL[kubectl logs ... csi-snapshotter]
+    E --> EL[kubectl logs ... csi-resizer]
+    F --> FL[kubectl logs ... csi-nfs-node -c nfs]
+    G --> GL[同上 = nfs コンテナ]
+```
+
+「PVC が Pending」 → `csi-provisioner` ログ、「Pod が ContainerCreating」 → `csi-nfs-node` ログ、「リサイズが進まない」 → `csi-resizer` ログ、と切り分けます。
+
+## 14.7 第 14 部のまとめ
+
+- ストレージプラグインは **in-tree → FlexVolume → CSI** と進化
+- `kubernetes.io/nfs` in-tree は **v1.25 で完全削除**、現在は `nfs.csi.k8s.io` が標準
+- CSI は Identity / Controller / Node の 3 gRPC サービス
+- NFS-CSI は `attachRequired: false`(attach フェーズなし)
+- 標準サイドカー(provisioner、snapshotter、resizer)が Kubernetes と CSI ドライバを橋渡し
+- NFS-CSI の `CreateVolume` は実質「NFS 上に mkdir するだけ」というシンプルな実装
+
+---
+
+# 第 15 部: セキュリティ深堀り(production-grade)
+
+第 7 部では NFS のセキュリティ基本を扱いましたが、本番投入には **多層防御** の発想が必要です。本パートでは production-grade のセキュリティ設計を段階的に組み立てます。
+
+## 15.1 攻撃面の整理
+
+```mermaid
+flowchart TB
+    A[NFS の攻撃面] --> B[ネットワーク層]
+    A --> C[認証層]
+    A --> D[認可層]
+    A --> E[データ保護]
+    A --> F[Kubernetes 統合面]
+    B --> B1[NFS サーバへの<br>不正接続]
+    B --> B2[平文通信の<br>盗聴]
+    B --> B3[サブネット<br>越境]
+    C --> C1[sec=sys の脆弱性<br>= UID 詐称]
+    C --> C2[ホスト指定<br>spoofing]
+    D --> D1[root_squash<br>突破]
+    D --> D2[squash 設定不備]
+    E --> E1[at-rest 暗号化なし]
+    E --> E2[バックアップ<br>無保護]
+    F --> F1[Pod の権限昇格]
+    F --> F2[hostPath 経由]
+    F --> F3[psp/PSA バイパス]
+```
+
+各層に対する対策を、**production レベル** で見ていきます。
+
+## 15.2 ネットワーク層: NetworkPolicy + Calico GlobalNetworkPolicy
+
+第 7.3 節で NetworkPolicy の基本を扱いました。本番ではこれに **クラスタ外側の制御** を組み合わせます。
+
+### 15.2.1 多層 NetworkPolicy 設計
+
+```mermaid
+flowchart TB
+    subgraph L1[Layer 1: クラスタ外側]
+        FW[VLAN / Firewall<br>192.168.56.0/24 のみ NFS 到達可]
+    end
+    subgraph L2[Layer 2: クラスタ Ingress]
+        CNP[Calico GlobalNetworkPolicy<br>すべてのノード]
+    end
+    subgraph L3[Layer 3: Namespace 境界]
+        NP1[NetworkPolicy<br>todo Namespace のみ NFS へ Egress 可]
+    end
+    subgraph L4[Layer 4: Pod 単位]
+        NP2[NetworkPolicy<br>必要な Pod だけ]
+    end
+    FW --> CNP --> NP1 --> NP2
+```
+
+### 15.2.2 ハンズオン: Calico GlobalNetworkPolicy
+
+Calico CNI を使っている前提です(本教材は Calico)。`GlobalNetworkPolicy` はクラスタ全体に適用される NetworkPolicy です。
+
+```yaml
+apiVersion: projectcalico.org/v3
+kind: GlobalNetworkPolicy
+metadata:
+  name: allow-nfs-egress-only-from-allowed
+spec:
+  selector: "k8s-app != ''"   # すべての Pod
+  types: [Egress]
+  egress:
+  # NFS サーバへの 2049/tcp は許可
+  - action: Allow
+    protocol: TCP
+    destination:
+      nets: [192.168.56.30/32]
+      ports: [2049]
+  # それ以外の 192.168.56.30 への通信は禁止
+  - action: Deny
+    destination:
+      nets: [192.168.56.30/32]
+  # 残りは通常通過(クラスタ内通信)
+  - action: Pass
+```
+
+```bash
+kubectl apply -f gnp-nfs.yaml
+# 効果確認: 例えば nfs-server の 22/SSH への接続が遮断される
+```
+
+これにより、**Pod から NFS サーバへの SSH を試みても遮断される** などの防御が効きます。
+
+### 15.2.3 NFS サーバ側のホストファイアウォール再確認
+
+```bash
+ssh k8s-nfs sudo ufw status verbose
+# To                         Action      From
+# 22/tcp                     ALLOW IN    192.168.56.0/24
+# 2049/tcp                   ALLOW IN    192.168.56.0/24
+# (default: deny incoming, allow outgoing)
+```
+
+**「クラスタ外のサブネットからは絶対に NFS が見えない」** ことを保証するレイヤです。
+
+## 15.3 認証層: sec=sys の限界と Kerberos(sec=krb5)
+
+### 15.3.1 sec=sys の脆弱性デモ
+
+`sec=sys` は **クライアントが申告する UID/GID をそのまま信用** します。つまりクライアントが嘘をついたら通ってしまいます。
+
+```bash
+# 攻撃のシナリオ
+# 攻撃者がクライアントノードで root を取った場合
+sudo -u "#0" cat /export/secret-file
+# UID 0 (root) として読みに行く → no_root_squash なら成功
+
+# UID 1000 のフリをすることもできる
+sudo -u "#1000" cat /export/user1000-file
+# UID 1000 として読みに行く → 通る
+```
+
+つまり、**「ノードのカーネル/OS を信頼している前提」** が `sec=sys` のセキュリティモデルです。マルチテナント環境や信頼できないノードを含む場合は **Kerberos** が必須になります。
+
+### 15.3.2 Kerberos(sec=krb5)の三段階
+
+| モード | 認証 | 完全性 | 暗号化 |
+|--------|------|--------|--------|
+| `sec=krb5` | ✅ チケットで認証 | ❌ | ❌ |
+| `sec=krb5i` | ✅ | ✅ チェックサム | ❌ |
+| `sec=krb5p` | ✅ | ✅ | ✅ AES |
+
+### 15.3.3 ハンズオン: Kerberos NFS の概略構築
+
+Kerberos の完全構築は本教材のスコープを超えますが、概略を示します。
+
+```bash
+# KDC(認証サーバ)のセットアップ
+sudo apt install -y krb5-kdc krb5-admin-server
+
+# realm 作成
+sudo kdb5_util create -s -r K8S.LOCAL
+
+# KDC 起動
+sudo systemctl start krb5-kdc krb5-admin-server
+
+# NFS サーバ用 principal を作る
+sudo kadmin.local -q "addprinc -randkey nfs/k8s-nfs.k8s.local"
+sudo kadmin.local -q "ktadd -k /etc/krb5.keytab nfs/k8s-nfs.k8s.local"
+
+# /etc/exports を Kerberos 化
+echo "/srv/nfs/k8s/static gss/krb5p(rw,sync,no_subtree_check)" \
+  | sudo tee /etc/exports
+sudo exportfs -ra
+
+# クライアント側で kinit してマウント
+sudo kinit user@K8S.LOCAL
+sudo mount -t nfs4 -o sec=krb5p k8s-nfs:/srv/nfs/k8s/static /mnt/nfs
+```
+
+Kubernetes Pod が Kerberos NFS を使う場合、**Pod 内に Kerberos チケット** を渡す必要があります(`gMSA` ConfigMap、自前 init container での `kinit` など)。マネージドサービスでは「AD 認証 NFS」として簡単化されているケースが多いです。
+
+### 15.3.4 Kerberos NFS の現実的な採用判断
+
+```mermaid
+flowchart TB
+    A[Kerberos NFS が必要?] --> B{マルチテナント?}
+    B -- Yes --> C{コンプラ要件?}
+    B -- No --> D[sec=sys でよい]
+    C -- HIPAA/PCI 等 --> E[必須]
+    C -- なし --> F{ネットワーク信頼?}
+    F -- できる --> D
+    F -- できない --> G[Kerberos + IPSec 検討]
+```
+
+実運用では「Kerberos NFS は **採用判断が重い**」のが現実で、多くのチームは:
+
+1. **クラスタネットワークを物理的に分離**(VPN / VLAN)
+2. **NFS サーバ自体への接続を絞る**(NetworkPolicy + ufw)
+3. **sec=sys で運用**
+
+という選択をしています。
+
+## 15.4 認可層: 細粒度の権限制御
+
+### 15.4.1 NFSv4 ACL
+
+NFSv4 は POSIX 標準を超える ACL をサポートします。サーバ側のファイルシステムが対応していれば、`nfs4_setfacl` で設定できます。
+
+```bash
+sudo apt install -y nfs4-acl-tools
+
+# /srv/nfs/k8s/static/private に対して、特定 UID のみアクセス許可
+sudo nfs4_setfacl -a "A::1000:rwx" /srv/nfs/k8s/static/private
+sudo nfs4_setfacl -a "A:g:devs@k8s.local:rx" /srv/nfs/k8s/static/private
+sudo nfs4_getfacl /srv/nfs/k8s/static/private
+# A::1000:rwatTnNcCy
+# A:g:devs@k8s.local:rxtncy
+```
+
+ただし Pod の UID が動的に変わると ACL マッチが破綻するので、Kubernetes 環境では **使うとしてもごく限定的** です。
+
+### 15.4.2 root_squash + anonuid/anongid の積極利用
+
+`root_squash` を `anonuid=999` のような **特定アプリ用 UID** にマップする使い方があります。
+
+```bash
+sudo tee -a /etc/exports <<'EOF'
+/srv/nfs/k8s/postgres  192.168.56.0/24(rw,sync,no_subtree_check,all_squash,anonuid=999,anongid=999,fsid=50)
+EOF
+sudo exportfs -ra
+```
+
+**`all_squash + anonuid=999`** とすると、Pod 内のどんな UID も **NFS サーバ側では UID 999** として書き込まれます。「Pod の UID 設定ミスでもデータの所有者が乱れない」という保険になります。
+
+### 15.4.3 ハンズオン: 「データベース専用」exports の分離
+
+PostgreSQL のデータは特別に扱う設計を作ります。
+
+```bash
+# サーバ側
+sudo mkdir -p /srv/nfs/k8s/dbprivate
+sudo chown 999:999 /srv/nfs/k8s/dbprivate
+sudo chmod 0700 /srv/nfs/k8s/dbprivate
+
+# /etc/exports に追加
+sudo tee -a /etc/exports <<'EOF'
+/srv/nfs/k8s/dbprivate  192.168.56.0/24(rw,sync,no_subtree_check,all_squash,anonuid=999,anongid=999,fsid=60)
+EOF
+sudo exportfs -ra
+```
+
+PostgreSQL 専用 StorageClass を別途作ります:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-db-private
+provisioner: nfs.csi.k8s.io
+parameters:
+  server: 192.168.56.30
+  share: /srv/nfs/k8s/dbprivate
+  subDir: ${pvc.metadata.namespace}-${pvc.metadata.name}
+mountOptions: [nfsvers=4.1, hard, noatime, nconnect=4]
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+```
+
+これで:
+
+- DB データは別 export 経由(他のワークロードと完全分離)
+- `all_squash + anonuid=999` で UID は強制的に 999 に固定
+- StorageClass で **DB 用 Pod だけが** この領域を使える
+
+## 15.5 データ保護: at-rest 暗号化
+
+### 15.5.1 NFS データの at-rest 暗号化選択肢
+
+| 層 | 手段 | 利点 | 欠点 |
+|----|------|------|------|
+| ディスク | LUKS(`dm-crypt`) | ボリューム単位、透過 | 鍵管理必要 |
+| ファイルシステム | eCryptfs / fscrypt | 個別ディレクトリ | パフォーマンス低下 |
+| 集中型 | ZFS native encryption | スナップショットと統合 | ZFS 採用必須 |
+| アプリ | PostgreSQL pgcrypto、`pg_data_at_rest` | 細粒度 | アプリ修正 |
+
+### 15.5.2 ハンズオン: LUKS で NFS データボリュームを暗号化
+
+第 2 部で構築した LVM 構成を、LUKS で暗号化し直します(注意: 既存データを消す手順です)。
+
+```bash
+# k8s-nfs で(既存データのバックアップ後に実施)
+sudo umount /srv/nfs
+sudo lvremove /dev/nfs_vg/nfs_lv
+
+# LUKS で暗号化
+sudo cryptsetup luksFormat /dev/nfs_vg/nfs_lv
+# Are you sure? Type 'YES'
+# Enter passphrase: <強いパスフレーズ>
+
+# 開く
+sudo cryptsetup luksOpen /dev/nfs_vg/nfs_lv nfs_crypt
+# 仮想デバイス /dev/mapper/nfs_crypt が出現
+
+# ファイルシステム作成
+sudo mkfs.ext4 -L nfs_data /dev/mapper/nfs_crypt
+sudo mount /dev/mapper/nfs_crypt /srv/nfs
+sudo mkdir -p /srv/nfs/k8s/{static,dynamic,backup}
+```
+
+ブート時に自動オープンするには `/etc/crypttab`:
+
+```
+# /etc/crypttab
+nfs_crypt  /dev/nfs_vg/nfs_lv  none  luks
+```
+
+これだとブート時にパスフレーズ入力が必要。本番では **鍵をリモート KMS から取得** する仕組み(Vault Transit、Tang、Clevis)を組み合わせます。
+
+### 15.5.3 暗号化のパフォーマンス影響
+
+- ext4 + AES-XTS で **概ね 5〜15% の性能低下**
+- AES-NI 対応 CPU なら影響小
+- ベンチマーク必須(第 9 部の fio で実測)
+
+## 15.6 in-transit 暗号化: NFS over TLS / IPSec
+
+### 15.6.1 NFS over TLS(RFC 9289, 2022)
+
+NFSv4.2 で **NFS over TLS(NFS-RFC4)** が標準化されました。Linux カーネル 6.5+ で利用可能。
+
+```bash
+# サーバ側
+sudo tee -a /etc/nfs.conf <<'EOF'
+[nfsd]
+xprtsec=mtls
+EOF
+
+# クライアント側マウント
+sudo mount -t nfs4 -o sec=sys,xprtsec=mtls server:/share /mnt
+```
+
+エンタープライズ Linux(RHEL 9.4+、Ubuntu 24.04+)以外ではまだ採用しにくい状況ですが、今後の標準になります。
+
+### 15.6.2 IPSec(過去の主流)
+
+カーネル IPSec(strongSwan、Libreswan)で IP 層暗号化を行い、NFS 通信を保護する方式。実装は複雑ですが、NFS over TLS が普及するまでの「現実解」として広く使われてきました。
+
+```bash
+sudo apt install -y strongswan
+# /etc/ipsec.conf に NFS サーバとの ESP を設定
+```
+
+VPN(WireGuard、OpenVPN)で代用するパターンもあります。
+
+### 15.6.3 SSH トンネル(緊急時)
+
+緊急対応として、SSH ポートフォワードで NFS を通すことが原理上可能です(本番では非推奨)。
+
+```bash
+ssh -L 2049:nfs-server:2049 jump-host
+sudo mount -t nfs4 localhost:/share /mnt
+```
+
+## 15.7 Kubernetes 統合面の硬化
+
+### 15.7.1 Pod Security Admission(PSA)
+
+第 7.5 節で扱いましたが、本番では **`restricted` プロファイル** を強制します。
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: todo
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+```
+
+`restricted` 下では:
+
+- `hostPath` 禁止 → 「NFS サーバを Pod 内で勝手にマウント」が阻止される
+- `runAsNonRoot: true` 強制
+- `allowPrivilegeEscalation: false` 強制
+- `seccompProfile` 必須
+
+NFS-CSI ドライバの Pod 自体は `restricted` を満たさない(特権が必要)ので、ドライバ用 Namespace は別途 `privileged` プロファイルで運用します。
+
+### 15.7.2 Kyverno / OPA Gatekeeper による Policy
+
+```yaml
+# Kyverno で「特定 Namespace では nfs-dynamic SC しか使わせない」
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: enforce-nfs-only
+spec:
+  validationFailureAction: enforce
+  rules:
+  - name: only-nfs-dynamic
+    match:
+      any:
+      - resources:
+          kinds: [PersistentVolumeClaim]
+          namespaces: [todo, staging]
+    validate:
+      message: "todo namespace must use nfs-dynamic StorageClass"
+      pattern:
+        spec:
+          storageClassName: nfs-dynamic
+```
+
+### 15.7.3 ServiceAccount と RBAC
+
+CSI スナップショットや手動 PV 操作を行う ServiceAccount は最小権限に絞ります。
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: snapshot-creator
+  namespace: todo
+rules:
+- apiGroups: [snapshot.storage.k8s.io]
+  resources: [volumesnapshots]
+  verbs: [create, get, list]
+```
+
+### 15.7.4 NFS マウントオプションでの硬化
+
+```yaml
+mountOptions:
+- nfsvers=4.1
+- hard
+- nosuid                  # setuid を禁止
+- nodev                   # デバイスファイル禁止
+- noexec                  # 実行ファイルとして使えなくする(uploads など)
+- noatime
+```
+
+`noexec` をアップロード領域に入れておくと、アップロードされたバイナリが Pod 内で実行されるリスクをサーバ側から遮断できます。
+
+## 15.8 監査ログとモニタリング
+
+### 15.8.1 NFS サーバ側監査
+
+```bash
+# auditd で /srv/nfs を監視
+sudo apt install -y auditd
+sudo tee -a /etc/audit/rules.d/nfs.rules <<'EOF'
+-w /srv/nfs -p wa -k nfs_data
+-w /etc/exports -p wa -k nfs_config
+-w /etc/nfs.conf -p wa -k nfs_config
+EOF
+sudo systemctl restart auditd
+
+# 監査ログを見る
+sudo ausearch -k nfs_data | head
+sudo ausearch -k nfs_config
+```
+
+### 15.8.2 Prometheus アラート例
+
+```yaml
+# 急激な NFS 接続増加(攻撃の兆候)
+- alert: NFSConnectionsSpike
+  expr: rate(node_nfsd_connections_total[5m]) > 100
+  for: 5m
+  
+# root_squash 違反の可能性
+- alert: NFSUnauthorizedAccess
+  expr: rate(nfs_audit_unauth_total[5m]) > 0
+```
+
+## 15.9 本番セキュリティチェックリスト
+
+```mermaid
+flowchart LR
+    L1[ネットワーク] --> L2[認証] --> L3[認可] --> L4[データ] --> L5[K8s 統合] --> L6[監査]
+```
+
+- [ ] NFS サーバはクラスタ外サブネットから到達不可
+- [ ] ufw / firewalld でクラスタ CIDR のみ 2049 許可
+- [ ] NetworkPolicy で Pod から NFS への egress を制限
+- [ ] Calico GlobalNetworkPolicy で全 Pod 共通の制約を入れる
+- [ ] `sec=sys` の限界を理解し、必要なら Kerberos / VPN を導入
+- [ ] `root_squash` を本番では絶対に有効化
+- [ ] `all_squash + anonuid=999` を機密データに使う
+- [ ] LUKS / fscrypt / ZFS encryption で at-rest 暗号化
+- [ ] NFS over TLS(対応 OS なら)or IPSec で in-transit 暗号化
+- [ ] Namespace に PSA `restricted` を貼る
+- [ ] Kyverno / OPA で StorageClass 利用を制約
+- [ ] `nosuid,nodev,noexec` をマウントオプションに
+- [ ] auditd で `/srv/nfs` と `/etc/exports` の変更を監視
+- [ ] Prometheus で NFS 接続/エラーを監視
+- [ ] バックアップ自体も暗号化(restic、gocryptfs)
+
+## 15.10 第 15 部のまとめ
+
+- 多層防御(ネットワーク・認証・認可・データ・K8s 統合)で攻撃面を縮小
+- `sec=sys` には UID 詐称の限界がある、本気のマルチテナントなら Kerberos
+- `all_squash + anonuid` は「Pod の UID 設定ミスでも所有者が乱れない」保険
+- LUKS による at-rest 暗号化が現実的選択
+- NFS over TLS が今後標準になる(現状は OS バージョン制約あり)
+- PSA `restricted` + Kyverno で K8s 側の硬化
+- auditd と Prometheus で監視可視化
+
+---
+
+# 第 16 部: Production HA 設計
+
+第 10 部で HA NFS の構築技術を扱いました。本パートでは **production 投入を前提に、SLO を満たす HA 設計** を体系的に組み立てます。
+
+## 16.1 SLO 駆動の設計
+
+HA 設計は **「何を、どのレベルで保証するか」** から始まります。
+
+```mermaid
+flowchart TB
+    A[SLO 定義] --> B[Availability<br>99.9% / 99.99% ?]
+    A --> C[RPO<br>許容データ損失]
+    A --> D[RTO<br>復旧時間]
+    A --> E[性能<br>p99 latency]
+    B --> F[実装選択]
+    C --> F
+    D --> F
+    E --> F
+```
+
+| SLO 指標 | 例 | 意味 |
+|---------|-----|------|
+| **Availability** | 99.9%(月 43 分以下のダウン) | サービス稼働率 |
+| **RPO**(Recovery Point Objective) | 5 分 | 最新何分までのデータが守られるか |
+| **RTO**(Recovery Time Objective) | 15 分 | 障害発生から復旧までの時間 |
+| **Latency p99** | 10ms | 99 パーセンタイル応答時間 |
+
+### 16.1.1 SLO から構成を逆算する
+
+```mermaid
+flowchart LR
+    A[99.9% Avail<br>RPO 1h<br>RTO 1h] --> B[単一 NFS<br>+ 毎時 rsync]
+    C[99.95% Avail<br>RPO 5min<br>RTO 15min] --> D[Pacemaker DRBD HA<br>+ VolumeSnapshot 5min]
+    E[99.99% Avail<br>RPO 30s<br>RTO 1min] --> F[商用アプライアンス<br>or マネージド]
+    G[99.999% Avail<br>RPO ≒0<br>RTO 30s] --> H[アクティブ-アクティブ<br>分散ストレージ + 多重化]
+```
+
+「**99.99% を達成するのに自前で組むより、AWS EFS / Azure NetApp Files を買うほうが安い**」という結論になる場合が多いのが現実です。
+
+## 16.2 障害モードと対策マッピング
+
+### 16.2.1 ありえる障害の網羅
+
+```mermaid
+flowchart TB
+    A[障害シナリオ] --> B[ハードウェア]
+    A --> C[ソフトウェア]
+    A --> D[人為的]
+    A --> E[セキュリティ]
+    A --> F[環境]
+    B --> B1[ディスク故障]
+    B --> B2[NIC 故障]
+    B --> B3[電源故障]
+    B --> B4[サーバ全死]
+    C --> C1[OS カーネル panic]
+    C --> C2[ファイルシステム破損]
+    C --> C3[NFS デーモン暴走]
+    D --> D1[誤削除]
+    D --> D2[設定ミス]
+    D --> D3[マイグレーション事故]
+    E --> E1[ランサムウェア]
+    E --> E2[内部犯行]
+    F --> F1[データセンタ災害]
+    F --> F2[電力喪失]
+    F --> F3[ネットワーク分断]
+```
+
+### 16.2.2 対策マッピング
+
+| 障害 | 対策 |
+|------|------|
+| ディスク故障 | RAID(または ZFS RAID-Z)、SMART モニタリング |
+| NIC 故障 | NIC bonding(active-backup、LACP) |
+| 電源故障 | デュアル PSU、UPS |
+| サーバ全死 | Pacemaker + DRBD、または分散ストレージ |
+| OS panic | watchdog、自動再起動 |
+| FS 破損 | バックアップ、ジャーナル FS(ext4/XFS) |
+| NFS デーモン暴走 | systemd Restart=always、メモリ制限 |
+| 誤削除 | Snapshot(時間軸冗長化) |
+| 設定ミス | GitOps、change review、Pre-prod での検証 |
+| ランサムウェア | Immutable backup(WORM、Object Lock) |
+| データセンタ災害 | リモートサイトレプリカ(rsync over WAN、ZFS send) |
+| 電力喪失 | UPS、複数電源系統 |
+| NW 分断 | Pacemaker の split-brain 対策(STONITH) |
+
+## 16.3 production 構成パターン
+
+### 16.3.1 パターン A: 単一 NFS + 多層バックアップ(SMB 中規模向け)
+
+```mermaid
+flowchart TB
+    subgraph DC1[Primary DC]
+        NFS1[NFS Server<br>RAID-6<br>NIC bonding]
+        BAK1[Local Backup<br>rsnapshot]
+    end
+    subgraph DC2[Secondary site]
+        BAK2[Remote Backup<br>rsync nightly]
+        S3[(Object Storage<br>WORM)]
+    end
+    NFS1 --> BAK1 --> BAK2 --> S3
+```
+
+| 観点 | 設計 |
+|------|------|
+| Availability | 99.5% 程度(年 1〜2 日のダウンを許容) |
+| RPO | 24 時間 |
+| RTO | 数時間〜半日 |
+| 実装 | 第 2 部 + 第 11 部の構成 |
+| 適合 | 小規模ビジネス、社内ツール |
+
+### 16.3.2 パターン B: Pacemaker + DRBD アクティブ-パッシブ HA(中規模本番)
+
+```mermaid
+flowchart TB
+    Cli[Clients] --> VIP[VIP 192.168.56.45]
+    VIP --> NFS1[NFS-HA1<br>Primary]
+    NFS1 <==DRBD 同期==> NFS2[NFS-HA2<br>Standby]
+    NFS1 -.snapshot.-> S3[(Object Storage)]
+```
+
+| 観点 | 設計 |
+|------|------|
+| Availability | 99.9% |
+| RPO | 数秒(DRBD 同期) |
+| RTO | 30 秒〜2 分(Pacemaker フェイルオーバ) |
+| 実装 | 第 10 部 + 第 15 部 + 監視 + 自動運用 |
+| 適合 | 中規模本番、エンタープライズ社内 |
+
+実装ポイント:
+
+- DRBD は **必ず Protocol C(同期)**
+- Pacemaker の **STONITH 必須**(本番では fencing なしの 2 ノード HA は地雷)
+- ネットワーク二重化(DRBD 専用 NIC + サービス NIC)
+- 監視: `pcs status`、DRBD 同期遅延、VIP 状態
+
+### 16.3.3 パターン C: 分散ストレージ + NFS-Ganesha(大規模)
+
+```mermaid
+flowchart TB
+    Cli[Clients] --> LB[Load Balancer]
+    LB --> G1[Ganesha-1] & G2[Ganesha-2] & G3[Ganesha-3]
+    G1 & G2 & G3 --> Ceph[CephFS Cluster<br>3+ OSD ノード]
+```
+
+| 観点 | 設計 |
+|------|------|
+| Availability | 99.95%+ |
+| RPO | ≒ 0(同期分散書き込み) |
+| RTO | 数秒〜数十秒 |
+| 実装 | Rook-Ceph + nfs-ganesha |
+| 適合 | 大規模、複数アプリ同居 |
+
+### 16.3.4 パターン D: マネージドサービス(クラウドネイティブ)
+
+```mermaid
+flowchart TB
+    K8s[EKS / AKS / GKE] --> CSI[CSI Driver]
+    CSI --> EFS[(AWS EFS<br>Multi-AZ)]
+    CSI --> ANF[(Azure NetApp Files)]
+    CSI --> FS[(GCP Filestore Enterprise)]
+```
+
+| 観点 | 設計 |
+|------|------|
+| Availability | 99.99%(SLA) |
+| RPO | ≒ 0 |
+| RTO | ≒ 0(常時 HA) |
+| 実装 | CSI ドライバを使うだけ |
+| 適合 | クラウドネイティブ全般、リソース最小化 |
+
+## 16.4 多重化ポイントの完全カバー
+
+production HA では **「単一障害点を 1 つも残さない」** ことが目標です。NFS で見落としがちなポイント:
+
+```mermaid
+flowchart TB
+    A[多重化ポイント] --> B[電源]
+    A --> C[ネットワーク]
+    A --> D[ストレージ]
+    A --> E[ノード]
+    A --> F[サイト]
+    B --> B1[2 系統電源<br>UPS]
+    C --> C1[NIC bonding]
+    C --> C2[L2 スイッチ冗長]
+    C --> C3[L3 ルータ冗長]
+    D --> D1[RAID 6 / Z2]
+    D --> D2[Hot spare]
+    E --> E1[2+ ノード HA]
+    F --> F1[Cross-DC レプリカ]
+```
+
+### 16.4.1 ハンズオン: NIC Bonding(active-backup)
+
+```bash
+# Ubuntu 22.04 で netplan の場合
+sudo tee /etc/netplan/00-bond.yaml <<'EOF'
+network:
+  version: 2
+  ethernets:
+    enp0s8: { dhcp4: no }
+    enp0s9: { dhcp4: no }
+  bonds:
+    bond0:
+      interfaces: [enp0s8, enp0s9]
+      addresses: [192.168.56.30/24]
+      parameters:
+        mode: active-backup
+        primary: enp0s8
+        mii-monitor-interval: 100
+EOF
+
+sudo netplan apply
+
+# 確認
+cat /proc/net/bonding/bond0
+# Bonding Mode: fault-tolerance (active-backup)
+# Primary Slave: enp0s8 (primary_reselect always)
+# Currently Active Slave: enp0s8
+# MII Status: up
+# Slave Interface: enp0s8 / enp0s9
+```
+
+### 16.4.2 ハンズオン: ZFS RAID-Z2 でディスク冗長
+
+ext4 + LVM では RAID は別途必要ですが、ZFS なら 1 つでカバーできます。
+
+```bash
+# 4 ディスク構成での RAID-Z2(2 ディスク故障まで耐性)
+sudo zpool create nfs-pool raidz2 /dev/sdb /dev/sdc /dev/sdd /dev/sde
+sudo zfs create nfs-pool/k8s
+
+# 状態
+sudo zpool status
+#   pool: nfs-pool
+#  state: ONLINE
+# config:
+#   NAME        STATE     READ WRITE CKSUM
+#   nfs-pool    ONLINE       0     0     0
+#     raidz2-0  ONLINE       0     0     0
+#       sdb     ONLINE
+#       sdc     ONLINE
+#       sdd     ONLINE
+#       sde     ONLINE
+```
+
+ディスクを抜いて挙動を確認できます(production では Hot spare も追加)。
+
+## 16.5 STONITH の重要性
+
+2 ノード HA で **split-brain** が起こると、両ノードが「自分が Primary」と思ってデータが分岐します。これを防ぐのが **STONITH(Shoot The Other Node In The Head)** です。
+
+```mermaid
+flowchart TB
+    A[ネットワーク分断] --> B{お互いの<br>到達性ロス}
+    B --> C[両ノードとも<br>「相手は死んだ」と判定]
+    C --> D[両方が Primary に]
+    D --> E[Split-brain<br>= データ分岐]
+    E --> F[復旧時に<br>致命的データロス]
+    G[STONITH 有効] -.防ぐ.-> E
+```
+
+### 16.5.1 STONITH の実装例
+
+| 方式 | 仕組み | 環境 |
+|------|--------|------|
+| IPMI / iLO / iDRAC | リモート電源管理で相手をシャットダウン | 物理サーバ |
+| 仮想化プラットフォーム | VMware vSphere の API で VM 停止 | VM 環境 |
+| クラウド | AWS EC2 API で stop-instances | クラウド |
+| PDU 制御 | スマート PDU で電源カット | データセンタ |
+| SBD(Storage-Based Death) | 共有ディスクのトークン書込で死亡通知 | DRBD/共有 SAN |
+
+### 16.5.2 ハンズオン: SBD-STONITH(参考)
+
+```bash
+sudo apt install -y sbd
+
+# 共有ブロックデバイス(本ハンズオンでは追加した /dev/sdc)を SBD 用に
+sudo sbd -d /dev/sdc create
+sudo sbd -d /dev/sdc list
+
+# Pacemaker に STONITH リソース追加
+sudo pcs stonith create sbd-fence external/sbd \
+  pcmk_host_list="nfs-ha1 nfs-ha2"
+
+sudo pcs property set stonith-enabled=true
+```
+
+**本番 2 ノード HA では STONITH なしは厳禁** です。「学習目的だから無効化」は OK ですが、production では必ず有効化してください。
+
+## 16.6 障害復旧プレイブック
+
+production では「**手順書がないと夜中の障害で詰む**」のが現実です。最低限以下のプレイブックを用意します。
+
+### プレイブック例: NFS サーバ全死
+
+```markdown
+# プレイブック: NFS Primary 全死
+
+## 兆候
+- Pacemaker `pcs status` で nfs-ha1 が UNCLEAN
+- VIP がどちらにも乗っていない / Secondary に乗っている
+- クライアント側で I/O ハング
+
+## エスカレーション
+- L1 サポート → L2 SRE(15分以内)→ DBA → CTO
+
+## 復旧手順
+1. `ssh nfs-ha2 sudo pcs status` で Secondary 状態確認
+2. Secondary が UP なら自動 failover を待つ(通常 30 秒)
+3. 自動 failover しない場合、`sudo pcs resource move vip_nfs nfs-ha2`
+4. クライアント側で I/O 再開確認
+5. nfs-ha1 の根本原因調査(iDRAC、コンソールログ、bootstrap)
+6. nfs-ha1 復旧後、`sudo pcs cluster start nfs-ha1`
+7. DRBD 同期完了を待つ(`drbdadm status`)
+8. failback は計画停止時間に実施(`pcs resource move vip_nfs nfs-ha1`)
+9. ポストモーテム作成
+
+## バックアウト
+- 自動 failover が機能しない & 緊急の場合
+  - クライアント側で手動マウント切替(VIP 直 → Secondary IP)
+- DRBD split-brain 発生時
+  - 1. どちらを採用するか判断(タイムスタンプ、業務影響度)
+  - 2. 棄却側で `drbdadm secondary && drbdadm invalidate`
+  - 3. 採用側を `drbdadm primary --force`
+  - 4. 同期完了まで監視
+```
+
+このようなプレイブックを **全障害パターン分** 用意し、定期的に演習します。
+
+## 16.7 容量計画と監視
+
+### 16.7.1 容量計画
+
+```mermaid
+flowchart LR
+    A[現状利用量] --> B[成長率予測]
+    B --> C[6ヶ月後/1年後]
+    C --> D[ストレージ追加計画]
+    D --> E[LVM 拡張<br>or<br>新ボリューム]
+```
+
+NFS は **データが増えるたびに止まらず拡張できる** のが利点。LVM の `lvextend + resize2fs`、ZFS の `zpool add` で運用中に拡張可能。
+
+### 16.7.2 監視メトリクス
+
+```yaml
+# Prometheus アラート例
+groups:
+- name: nfs-production
+  rules:
+  - alert: NFSDiskUsageHigh
+    expr: (node_filesystem_avail_bytes{mountpoint="/srv/nfs"} / node_filesystem_size_bytes{mountpoint="/srv/nfs"}) < 0.15
+    for: 10m
+    annotations:
+      summary: NFS data disk < 15% free
+    labels:
+      severity: warning
+
+  - alert: NFSDiskUsageCritical
+    expr: (node_filesystem_avail_bytes{mountpoint="/srv/nfs"} / node_filesystem_size_bytes{mountpoint="/srv/nfs"}) < 0.05
+    for: 5m
+    labels:
+      severity: critical
+
+  - alert: NFSDPanic
+    expr: rate(node_nfsd_panic_total[5m]) > 0
+    labels:
+      severity: critical
+
+  - alert: NFSLatencyHigh
+    expr: histogram_quantile(0.99, rate(nfs_op_duration_seconds_bucket[5m])) > 0.1
+    for: 10m
+    annotations:
+      summary: NFS p99 > 100ms
+
+  - alert: PacemakerNodeDown
+    expr: pacemaker_node_status == 0
+    for: 1m
+    labels:
+      severity: critical
+
+  - alert: DRBDOutOfSync
+    expr: drbd_oos_kb > 1024
+    for: 5m
+```
+
+## 16.8 災害復旧(DR)サイト
+
+production の最終ガードは **「データセンタごと吹き飛んでも、別サイトから復旧できる」** です。
+
+```mermaid
+flowchart LR
+    subgraph Pri[Primary DC]
+        PrimNFS[Primary NFS HA]
+    end
+    subgraph DR[DR site - 地理的に離れた場所]
+        DRNFS[DR NFS - Standby]
+        DRK8s[DR Kubernetes]
+    end
+    Pri -.zfs send -i / rsync.-> DR
+    Pri -.Velero backup.-> S3[(Object Storage<br>Cross-region replicated)]
+    S3 -.復元先.-> DR
+```
+
+| DR 形態 | RPO | RTO | コスト |
+|---------|-----|-----|--------|
+| Cold(月次バックアップ持出) | 30 日 | 24 時間 | 低 |
+| Warm(日次差分 + 月次フル) | 24 時間 | 4 時間 | 中 |
+| Hot(リアルタイムレプリカ) | 数分 | 30 分 | 高 |
+| Active-Active | ≒0 | ≒0 | 最高 |
+
+### 16.8.1 ZFS send による Warm DR
+
+```bash
+# Primary でスナップショット
+sudo zfs snapshot nfs-pool/k8s@daily-$(date +%F)
+
+# DR サイトへ差分転送
+sudo zfs send -i nfs-pool/k8s@daily-2026-05-08 nfs-pool/k8s@daily-2026-05-09 \
+  | ssh dr-nfs sudo zfs receive dr-pool/k8s
+```
+
+cron で日次実行。RPO 24h を達成。
+
+### 16.8.2 Velero クロスリージョン
+
+```bash
+velero install \
+  --bucket velero-dr-region \
+  --backup-location-config region=us-west-2 \
+  ...
+
+# 定期バックアップ
+velero schedule create daily \
+  --schedule="0 1 * * *" \
+  --include-namespaces todo \
+  --ttl 168h
+```
+
+復元時は DR の K8s クラスタに同じ Velero を入れて `velero restore` で戻します。
+
+## 16.9 ハンズオン: 全障害復旧演習
+
+四半期に 1 度、以下の演習を実機で行います。
+
+```bash
+#!/bin/bash
+# 障害復旧演習スクリプト
+# 注意: ステージング環境で実施
+
+# 演習 1: Primary NFS をシャットダウン → 自動 failover 確認
+echo "=== Test 1: Primary NFS shutdown ==="
+START=$(date +%s)
+ssh nfs-ha1 sudo shutdown -h now &
+sleep 60
+ssh nfs-ha2 pcs status
+RECOVERY=$(( $(date +%s) - START ))
+echo "Failover time: ${RECOVERY}s"
+
+# 演習 2: DRBD 同期遅延注入 → 検知時間測定
+echo "=== Test 2: DRBD lag injection ==="
+ssh nfs-ha1 sudo tc qdisc add dev eth0 root netem delay 500ms
+# Prometheus でアラート発火を確認
+sleep 600
+ssh nfs-ha1 sudo tc qdisc del dev eth0 root
+
+# 演習 3: バックアップから完全復元
+echo "=== Test 3: Full restore from backup ==="
+kubectl create namespace test-restore
+velero restore create --from-backup latest-daily --namespace-mappings todo:test-restore --wait
+kubectl exec -n test-restore postgres-0 -- psql -U todo -c "SELECT count(*) FROM tasks;"
+kubectl delete namespace test-restore
+
+# 演習 4: DR サイト切替
+echo "=== Test 4: DR site failover ==="
+# DR サイトの DNS を本番に切替
+# DR の Velero で復元
+# クライアントの接続テスト
+```
+
+このような演習を **書面で計画し、実機で実行し、結果を記録** する文化が production の HA を支えます。
+
+## 16.10 第 16 部のまとめ
+
+- HA 設計は **SLO 駆動**(Availability、RPO、RTO、Latency)
+- 構成パターンは 4 種類(単一+バックアップ、HA+DRBD、分散+Ganesha、マネージド)
+- **STONITH なしの 2 ノード HA は地雷**(split-brain 必発)
+- NIC bonding、RAID、UPS で物理層も冗長化
+- プレイブック整備と定期演習は production の絶対条件
+- DR サイトを **離れた場所** に持つ(地震、停電、政情)
+- 監視・アラート・容量計画は HA とセットで設計
+
+---
+
+# 第 17 部: NFS の弱点と限界
+
+ここまで NFS の良さばかり強調してきましたが、**「使うべきでない場面」** を見抜く力は、技術者として等しく重要です。本パートでは NFS の構造的弱点を体系的に整理します。
+
+## 17.1 NFS の 5 大弱点
+
+```mermaid
+flowchart TB
+    A[NFS の構造的弱点] --> B[単一障害点 SPOF]
+    A --> C[レイテンシ]
+    A --> D[メタデータ性能]
+    A --> E[ロック問題]
+    A --> F[ネットワーク依存]
+```
+
+| 弱点 | 影響度 | 緩和策の有無 | 影響範囲 |
+|------|--------|------------|---------|
+| 単一障害点 | 高 | あり(HA 化) | 全クライアント |
+| レイテンシ | 中〜高 | 限定的 | OLTP・低レイテンシ要件 |
+| メタデータ性能 | 中 | 限定的 | 多数小ファイルワークロード |
+| ロック問題 | 中 | NFSv4 で改善 | DB・並行書込 |
+| ネットワーク依存 | 高 | あり(専用 NW) | 全アクセス |
+
+それぞれを深く見ていきます。
+
+## 17.2 弱点 1: 単一障害点(SPOF)
+
+### 17.2.1 何が単一障害点か
+
+```mermaid
+flowchart TB
+    subgraph Single[単一 NFS 構成]
+        K8s[K8s クラスタ<br>全 Pod] --> NFS[NFS サーバ 1 台]
+        NFS --> D[(ディスク)]
+        NFS --> N[(NIC)]
+        NFS --> P[(電源)]
+    end
+```
+
+単一の NFS サーバ構成では、**サーバ全体だけでなく、その中の任意のコンポーネント故障** がクラスタ全体のストレージ I/O を止めます。
+
+| 故障ポイント | 影響 |
+|------------|------|
+| サーバ電源 | 全 NFS クライアント停止 |
+| NIC | 同上 |
+| カーネル panic | 同上 |
+| ディスク(RAID なし) | データ損失 |
+| OS バグ | 同上 |
+| 設定ミス | 同上 |
+
+### 17.2.2 SPOF の実害シナリオ
+
+```mermaid
+flowchart LR
+    A[NFS サーバ落ちる] --> B[全クライアントの<br>I/O ハング]
+    B --> C[Pod が hard mount で<br>無限待ち]
+    C --> D[Liveness Probe<br>失敗で再起動]
+    D --> E[再起動した Pod も<br>マウントできない]
+    E --> F[全アプリ停止]
+```
+
+「Pod のレプリカを増やしても、ストレージが 1 つなら冗長化にならない」のが NFS の致命的な構造です。
+
+### 17.2.3 緩和策
+
+| 対策 | 効果 | コスト |
+|------|------|--------|
+| Pacemaker + DRBD HA | サーバ全死に耐性 | 中(2 ノード分) |
+| 分散 FS(Ceph/Gluster) | スケールアウト冗長 | 高(3+ ノード、運用工数) |
+| 商用アプライアンス | 標準で HA | 高(ライセンス) |
+| マネージド NFS(EFS 等) | クラウド側が保証 | 従量課金 |
+| バックアップ強化 | 復元時間を短縮 | 低 |
+
+### 17.2.4 「SPOF と分かって使う」設計
+
+すべてを冗長化するとコストが爆発するので、「**SPOF だと自覚した上で運用する**」のも選択肢です。
+
+- **Tier 1 データ**(顧客 DB):ローカル SSD + アプリレベルレプリケーション
+- **Tier 2 データ**(セッション、キャッシュ):NFS + 多層バックアップ
+- **Tier 3 データ**(ログ、解析素材):NFS + リモートレプリカ
+
+データの重要度ごとにストレージ種別を選ぶ「**ストレージ層の階層化**」が production の常識です。
+
+## 17.3 弱点 2: レイテンシ
+
+### 17.3.1 NFS レイテンシの内訳
+
+```mermaid
+flowchart LR
+    A[Pod] -->|VFS| B[NFS Client]
+    B -->|RPC over TCP| C[Network]
+    C -->|2049 LISTEN| D[NFS Server]
+    D -->|VFS| E[ローカル FS]
+    E -->|hw| F[Disk]
+```
+
+各レイヤでのレイテンシ加算(典型値、低負荷時):
+
+| レイヤ | レイテンシ追加 |
+|--------|--------------|
+| Pod → NFS Client(VFS) | ~50µs |
+| NFS Client → Network | ~10µs |
+| Network(1GbE) | RTT ~200µs |
+| Network(10GbE) | RTT ~50µs |
+| NFS Server → ローカル FS | ~50µs |
+| ローカル FS → SSD(同期書込) | ~100µs |
+| **合計(1GbE)** | **~410µs / 操作** |
+| **合計(10GbE)** | **~260µs / 操作** |
+| **比較: ローカル SSD** | **~150µs / 操作** |
+
+つまり NFS は **ローカル SSD 比でレイテンシ 2〜3 倍** です。
+
+### 17.3.2 PostgreSQL での実害
+
+```bash
+# pgbench で TPS 比較(参考値)
+# ローカル SSD:           2,500 TPS
+# NFS over 10GbE:         400〜800 TPS
+# NFS over 1GbE:          200〜400 TPS
+```
+
+PostgreSQL は WAL 書き込みごとに `fsync` を呼ぶため、**レイテンシが直接 TPS に効きます**。同期書込が必要な OLTP は NFS では性能が出ません。
+
+### 17.3.3 緩和策と限界
+
+| 手法 | 効果 | 限界 |
+|------|------|------|
+| 10GbE 化 | レイテンシ半減 | 物理的に光速限界がある |
+| `nconnect=4` | 並列度向上(レイテンシ自体は変わらない) | 単発オペは速くならない |
+| async export(`async`) | 50〜80% 改善 | データロスリスク |
+| サーバ側 NVMe | サーバ側遅延を減らす | ネットワーク部分は不変 |
+| アプリ層キャッシュ | I/O 回数自体を減らす | アプリ修正 |
+| RDMA(NFS-RDMA) | RTT 大幅短縮 | InfiniBand 機材必要 |
+
+**「同期書込を多用する OLTP には NFS は本質的に不向き」** は揺らぎません。これは緩和策の話ではなく、**プロトコル的限界** です。
+
+### 17.3.4 ハンズオン: NFS とローカルのレイテンシ比較
+
+```bash
+# NFS PVC を持つ Pod
+kubectl exec -n todo postgres-0 -- \
+  fio --name=lat --rw=randwrite --bs=4k --iodepth=1 --runtime=30 \
+      --time_based --direct=1 --sync=1 --filename=/var/lib/postgresql/data/pgdata/fio-test
+# clat (usec): min=400, avg=2500, max=20000     ← NFS の典型値
+
+# ノード上で local-path
+kubectl exec -n bench local-fio-0 -- \
+  fio --name=lat --rw=randwrite --bs=4k --iodepth=1 --runtime=30 \
+      --time_based --direct=1 --sync=1 --filename=/data/fio-test
+# clat (usec): min=80, avg=200, max=1500        ← local SSD は 1 桁 µs 速い
+```
+
+数字が **オーダー違い** なのが分かります。
+
+### 17.3.5 OLTP DB を NFS で動かす場面の判断
+
+```mermaid
+flowchart TB
+    A[OLTP DB を NFS で動かす?] --> B{TPS 要件?}
+    B -- <100 --> C[NFS で十分]
+    B -- 100~1000 --> D{許容レイテンシ?}
+    D -- p99 <100ms --> E[NFSv4.1+ 10GbE で要検証]
+    D -- p99 <10ms --> F[ローカル SSD 推奨]
+    B -- >1000 --> F
+```
+
+学習・小規模社内ツールは NFS で十分、商用 OLTP は **NFS では避けるのが原則**。
+
+## 17.4 弱点 3: メタデータ性能
+
+### 17.4.1 メタデータ操作とは
+
+ファイル**内容**ではなく、**ファイルの構造情報** に対する操作です。
+
+- `stat()` / `lstat()` ─ 属性取得
+- `readdir()` ─ ディレクトリ列挙
+- `open()` / `close()` ─ ファイルディスクリプタ確保
+- `lookup` ─ 名前 → inode 解決
+- `rename` / `link` / `unlink` ─ ディレクトリ書換
+- `getxattr` ─ 拡張属性
+
+### 17.4.2 NFS でのメタデータ性能問題
+
+各メタデータ操作は **1 つの RPC 呼出を必要とする** ため、ネットワーク往復が直接効きます。
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant N as NFS Server
+    Note over C,N: ls -la /mnt/nfs/dir (1000 ファイル)
+    C->>N: READDIR
+    N-->>C: 100 entries
+    C->>N: GETATTR for each entry × 1000
+    N-->>C: attrs × 1000
+    Note over C: 1000+ RTT 発生!
+```
+
+`ls -la` が 1 ディレクトリで 1000 ファイル列挙するのに、**1000 回以上のラウンドトリップ** が発生することがあります。
+
+### 17.4.3 実害シナリオ
+
+| ワークロード | NFS での挙動 |
+|------------|-------------|
+| `find /mnt/nfs -type f` | 1 ファイルにつき複数 RPC、巨大ディレクトリで数分〜数十分 |
+| `ls -lR` | 同上、再帰深さに比例 |
+| `git status`(NFS 上の repo) | 全ファイルの mtime チェック → 激遅 |
+| Maven / npm の依存解決 | 数千の小ファイルへ stat |
+| Docker build context 転送 | 大量の stat |
+| 大量小ファイル削除 | 1 ファイルごとに RPC |
+
+### 17.4.4 ハンズオン: メタデータ性能の実測
+
+```bash
+# 1000 ファイルを作る
+kubectl exec -n todo file-generator -- \
+  sh -c "for i in \$(seq 1 1000); do touch /data/f-\$i; done"
+
+# ls -la の時間
+kubectl exec -n todo file-generator -- time ls -la /data | tail -5
+# real    0m3.456s   ← NFS
+
+# 比較: ローカル
+kubectl exec -n local file-gen-local -- time ls -la /data
+# real    0m0.123s   ← ローカル
+```
+
+ファイル数を 1万 にすると差がさらに開きます。
+
+### 17.4.5 緩和策
+
+| 手法 | 効果 | 限界 |
+|------|------|------|
+| `actimeo=N` 大きく | キャッシュヒットでメタデータ RPC 削減 | 整合性低下 |
+| `lookupcache=all` | 名前解決キャッシュ強化 | 削除・リネームで不整合リスク |
+| Directory delegation(NFSv4.1+) | ディレクトリ単位委譲 | サーバ実装依存 |
+| pNFS でメタデータ分散 | スケールアウト | 商用機向け |
+| アプリ層変更(階層化) | ディレクトリを小さく | 設計改変 |
+
+### 17.4.6 「NFS で git が遅い」問題
+
+DevOps チームでよくあるシナリオ。Git は `.git/objects/` に大量の小ファイルを置き、`git status` で全ファイルの mtime をチェックします。**NFS 上の git repo は使い物にならない** ことが多いです。
+
+回避策:
+
+- 開発者ホームディレクトリは NFS にせず、ローカル
+- CI/CD では `.git` だけ tar で送って tmpfs 展開
+- `git config core.preloadIndex true`、`core.fsmonitor` 等のチューニング
+
+## 17.5 弱点 4: ロック問題
+
+### 17.5.1 NFS ロックの歴史的弱点
+
+```mermaid
+timeline
+    title NFS ロックの進化
+    NFSv2/v3 : NLM 別プロトコル<br>クライアント死 = ロック残骸
+    NFSv4    : プロトコル組込<br>状態管理改善
+    NFSv4.1  : セッションモデル<br>exactly-once
+```
+
+### 17.5.2 NFSv3 NLM の問題
+
+- 別プロトコル(`lockd`、`statd`)が必要
+- クライアントが死ぬとロック復旧に時間
+- **PostgreSQL 公式が NFSv3 を非推奨** とした歴史
+- ロックリーク(プロセスが死んでロックが残る)
+
+### 17.5.3 NFSv4 でも残る課題
+
+- **クライアント時刻同期が必須**(リース時間管理)
+- ネットワーク分断時のロック状態管理
+- 多 Pod から同一ファイルへのロック競合
+
+### 17.5.4 ハンズオン: ロック競合の観察
+
+```bash
+# 2 つの Pod が同じファイルに `flock` を取り合う
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: locker-1
+spec:
+  containers:
+  - name: app
+    image: alpine
+    command: ["sh","-c","apk add flock && while true; do flock /data/lock -c 'date >> /data/log.txt; sleep 1'; done"]
+    volumeMounts: [{ name: data, mountPath: /data }]
+  volumes:
+  - name: data
+    persistentVolumeClaim: { claimName: uploads }
+EOF
+# locker-2 も同様に作る
+
+# /data/log.txt にどのくらいの頻度で書けるか
+kubectl exec locker-1 -- tail -f /data/log.txt
+```
+
+NFS だとロック取得・解放が往復するため、競合が激しいと急激にスループット低下します。
+
+### 17.5.5 緩和策
+
+| 手法 | 効果 |
+|------|------|
+| NFSv4.1+ 統一 | ロック信頼性向上 |
+| `nolock` マウント | 単一プロセスの場合のみ(共有禁止) |
+| 時刻同期厳格化 | リース処理の安定 |
+| アプリ層レイヤでロック | NFS ロックに頼らない(Redis、DB の row lock) |
+
+**DB は DB エンジン内部でロックを管理する** ので、PostgreSQL や MySQL がうまく動くかは NFS ロックの信頼性次第。「**NFS で OLTP やるなら NFSv4.1+ 必須**」が業界の暗黙合意です。
+
+## 17.6 弱点 5: ネットワーク依存
+
+### 17.6.1 何がネットワーク依存か
+
+NFS のあらゆる操作は **ネットワーク経由** です。これは利点(共有可能)でもあり、最大の弱点でもあります。
+
+```mermaid
+flowchart TB
+    A[ネットワーク依存] --> B[帯域]
+    A --> C[レイテンシ]
+    A --> D[パケットロス]
+    A --> E[ジッタ]
+    A --> F[分断]
+    B --> B1[NIC 性能上限]
+    C --> C1[物理距離 + ホップ数]
+    D --> D1[再送で性能劣化]
+    E --> E1[アプリの揺らぎ]
+    F --> F1[全 I/O 停止]
+```
+
+### 17.6.2 帯域の例(クラスタ全体共有)
+
+- 1GbE = 125 MB/s 理論値、実効 100 MB/s 程度
+- これを **クラスタの全クライアントで共有**
+- 10 ノード × 10 MB/s で帯域消費すると即飽和
+
+10GbE = 1 GB/s 理論値で、これも本気のクラスタなら詰まることがあります。
+
+### 17.6.3 ハンズオン: 帯域飽和の実演
+
+```bash
+# 全ワーカーで同時に大量書込
+for w in k8s-w1 k8s-w2 k8s-w3; do
+  kubectl exec -n bench fio-pod-$w -- fio --rw=write --bs=1M --runtime=60 --time_based --filename=/data/fio &
+done
+
+# サーバ側で iperf3 + iftop で帯域消費を見る
+ssh k8s-nfs sudo iftop -i bond0
+# 1GbE の場合、すぐ 940Mbps で頭打ち
+```
+
+### 17.6.4 ネットワーク分断時の挙動
+
+NFS は **ネットワークが切れた瞬間に I/O が止まる**。`hard` マウントなら永遠に待ち、`soft` ならエラー。
+
+`grace-time`(NFSv4 のリース回復時間、デフォルト 90 秒)も加味すると、**短時間の NW 切断でも数十秒の I/O 停止** は避けられません。
+
+### 17.6.5 緩和策
+
+| 手法 | 効果 | コスト |
+|------|------|--------|
+| 10GbE / 25GbE / 100GbE | 帯域確保 | NIC・スイッチ更新 |
+| NIC bonding | 帯域 + 冗長 | スイッチ設定 |
+| ストレージ専用 VLAN | 業務トラフィックと分離 | NW 設計 |
+| RDMA(NFS-RDMA) | 低レイテンシ・低 CPU | InfiniBand 機材 |
+| クライアント側キャッシュ強化 | RPC 数削減 | 整合性 |
+| ローカル SSD への階層化 | NFS 依存度低減 | アプリ設計 |
+
+### 17.6.6 ストレージ専用ネットワーク
+
+production では **ストレージ専用 NIC** を別系統で用意することが多いです。
+
+```mermaid
+flowchart TB
+    subgraph N1[Node]
+        eth0[eth0<br>192.168.10.x<br>業務 LAN]
+        eth1[eth1<br>10.0.0.x<br>ストレージ専用]
+    end
+    eth0 -->|API/Pod 通信| Net1[業務スイッチ]
+    eth1 -->|NFS| Net2[ストレージスイッチ]
+    Net2 --> NFS[NFS サーバ]
+```
+
+これで:
+
+- 業務トラフィックと NFS が干渉しない
+- セキュリティ(NFS が業務 LAN 経由でアクセスされない)
+- 性能(専用帯域)
+
+## 17.7 NFS の弱点を「踏まない」設計フローチャート
+
+```mermaid
+flowchart TB
+    A[NFS を使うか?] --> B{SPOF 受容?}
+    B -- No --> B1[HA / 分散 / マネージドへ]
+    B -- Yes --> C{レイテンシ要件?}
+    C -- p99 <10ms 必須 --> C1[ローカル SSD]
+    C -- 緩い --> D{メタデータ多い?}
+    D -- Yes --> D1[アプリ層キャッシュ or 階層化]
+    D -- No --> E{ロック多い?}
+    E -- Yes --> E1[NFSv4.1+ 必須、ロックは慎重テスト]
+    E -- No --> F{NW 信頼?}
+    F -- Yes --> G[NFS で OK]
+    F -- No --> F1[専用 NW + bonding]
+```
+
+## 17.8 NFS が「使えない」ワークロード一覧
+
+私たちが本教材で NFS を中心に据えていても、**本当に使ってはいけないワークロード** はあります。
+
+| ワークロード | NFS NG な理由 | 代替 |
+|------------|--------------|------|
+| etcd / Consul | 同期書込・ロックの厳しさ | local PV + アプリ層複製 |
+| Kafka | 高スループット sequential、レプリケーション | local PV、Kafka 内蔵レプリカ |
+| Elasticsearch インデックス | 同様 | local PV |
+| 高 TPS OLTP DB | レイテンシ | local PV + DB レプリケーション |
+| 大規模 git monorepo | メタデータ性能 | ローカル SSD |
+| iOS 開発の Xcode キャッシュ | メタデータ・並行性 | ローカル SSD |
+| Bazel / Buck の `.bazel-cache` | メタデータ | ローカル SSD |
+| ブロックデバイスが必要なもの | ファイル抽象では無理 | iSCSI、Ceph RBD |
+
+## 17.9 NFS を選ぶときのチェックリスト
+
+```mermaid
+flowchart LR
+    A[要件分析] --> B[弱点との照合] --> C[緩和策の確認] --> D[採用決定]
+```
+
+- [ ] SPOF を受容できるか、HA 化するか
+- [ ] レイテンシ要件は緩いか、それとも厳しいか
+- [ ] メタデータ操作の量を見積もっているか
+- [ ] ファイルロックの使用頻度を見積もっているか
+- [ ] ストレージ専用 NW を用意できるか
+- [ ] バックアップ・DR を設計しているか
+- [ ] アプリのキャッシュ戦略を持っているか
+- [ ] 代替(local PV、分散 FS、マネージド)を検討したか
+
+## 17.10 第 17 部のまとめ
+
+- NFS には 5 大弱点(SPOF、レイテンシ、メタデータ、ロック、NW 依存)が **構造的に存在**
+- 緩和策はあるが、**プロトコル的限界もある**
+- OLTP DB、etcd、Kafka など特定ワークロードでは **NFS を選んではいけない**
+- 弱点を理解した上で **適性に応じてストレージを階層化** するのが production 設計
+- 「すべてを NFS で」「すべてを分散 FS で」は両方とも誤り
+- 本教材の学習段階では NFS で十分、要件が出たら段階的に移行
+
+---
+
 # 全体のチェックポイント
 
 このページ全体で **以下を自分の言葉で説明できる** か確認してください。
@@ -8094,6 +9994,52 @@ ssh k8s-nfs "sudo rm -rf /srv/nfs/k8s/static/uploads/*"
 - [ ] NFS サーバ再起動時の `hard` マウント挙動を観察し、説明できる
 - [ ] スナップショット → 別 PVC への復元演習を完遂できる
 - [ ] ワーカーノード障害時に Pod が別ノードへ移動することを確認できる
+
+## CSI Driver 深堀り(第 14 部)
+
+- [ ] in-tree plugin → FlexVolume → CSI への進化の動機を説明できる
+- [ ] `kubernetes.io/nfs` in-tree が v1.25 で完全削除されたこと、Migration shim もないことを述べられる
+- [ ] CSI の 3 サービス(Identity / Controller / Node)の役割
+- [ ] NFS-CSI が `attachRequired: false` である理由
+- [ ] `NodeStageVolume` と `NodePublishVolume` の 2 段階マウント構造
+- [ ] 標準サイドカー(provisioner、snapshotter、resizer、node-driver-registrar)が何を監視して何を呼ぶか
+- [ ] NFS-CSI の `CreateVolume` 実装が実質「mkdir」であること
+- [ ] `CSIDriver` CRD の主要フィールド(`attachRequired`、`podInfoOnMount`、`fsGroupPolicy`)
+
+## セキュリティ深堀り(第 15 部)
+
+- [ ] `sec=sys` で UID 詐称が起こりうる仕組み
+- [ ] Kerberos の 3 段階(`krb5` / `krb5i` / `krb5p`)の違い
+- [ ] `all_squash + anonuid=999` が「Pod の UID 設定ミスに対する保険」となる仕組み
+- [ ] Calico GlobalNetworkPolicy で全 Pod に共通制約を適用する設計
+- [ ] LUKS による at-rest 暗号化のセットアップ手順
+- [ ] NFS over TLS(NFSv4.2)の現状と利用条件
+- [ ] PSA `restricted` 適用時に CSI ドライバ Pod は別 Namespace に置く理由
+- [ ] `nosuid,nodev,noexec` マウントオプションの効用
+
+## Production HA 設計(第 16 部)
+
+- [ ] SLO(Availability、RPO、RTO、Latency)を起点に HA 構成を選ぶ流れ
+- [ ] 4 つの構成パターン(単一+バックアップ、Pacemaker+DRBD、分散+Ganesha、マネージド)の使い分け
+- [ ] **STONITH なしの 2 ノード HA が地雷** である理由(split-brain)
+- [ ] 多重化ポイント(電源、NIC、ディスク、ノード、サイト)
+- [ ] NIC bonding(active-backup)の設定と確認
+- [ ] ZFS RAID-Z2 とディスク冗長
+- [ ] 障害復旧プレイブックに含めるべき要素
+- [ ] DR サイト構成パターン(Cold / Warm / Hot / Active-Active)と RPO/RTO トレードオフ
+- [ ] ZFS send による差分転送、Velero クロスリージョン
+- [ ] 四半期の障害復旧演習
+
+## NFS の弱点と限界(第 17 部)
+
+- [ ] NFS の 5 大弱点(SPOF、レイテンシ、メタデータ、ロック、NW 依存)を列挙し、それぞれの実害シナリオを述べられる
+- [ ] **OLTP DB を NFS で動かすとなぜ TPS が下がるか**(同期書込 × レイテンシ)
+- [ ] メタデータ操作の RPC コストと、`ls -la` が NFS で遅い理由
+- [ ] `git status` が NFS 上の repo で遅い具体的メカニズム
+- [ ] NFSv3 NLM の歴史的問題と、NFSv4 で何が改善されたか
+- [ ] ストレージ専用ネットワークを業務 LAN と分離する設計
+- [ ] NFS が **絶対に使えない** ワークロード(etcd / Kafka / 高 TPS DB / Bazel 等)
+- [ ] 「データの重要度ごとにストレージ層を階層化する」設計思想
 
 ---
 
