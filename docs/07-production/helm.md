@@ -404,7 +404,8 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{- define "todo.chart" -}}
-{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- $name := printf "%s-%s" .Chart.Name .Chart.Version }}
+{{- $name | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 ```
 
